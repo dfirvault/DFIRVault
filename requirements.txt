@@ -1,0 +1,19 @@
+# Core Dependencies
+colorama>=0.4.6
+pywin32>=306          # Windows API and COM support (Task Scheduler, Registry)
+
+# Optional but recommended for full functionality
+pandas>=2.0.0         # CSV to Elasticsearch data processing
+requests>=2.31.0      # Elasticsearch API communication
+paramiko>=3.0.0       # SFTP/SSH connectivity
+watchdog>=3.0.0       # Real-time file system monitoring
+tqdm>=4.66.0          # Progress bars for file transfers
+
+# Optional - for encrypted ZIP support in Splunk backups
+pyzipper>=0.3.6       # AES-256 encrypted ZIP files
+
+# Development dependencies (not required for runtime)
+# pytest>=7.0.0       # For running tests
+# pytest-cov>=4.0.0   # Test coverage reporting
+# black>=23.0.0       # Code formatting
+# flake8>=6.0.0       # Linting
