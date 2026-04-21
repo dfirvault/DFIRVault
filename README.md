@@ -82,6 +82,11 @@ Developed by a DFIR practitioner for DFIR practitioners, DFIRVault integrates ca
 - **Bi-directional sync** option for mirroring
 - **Deleted file vault** with automatic purging
 
+### 9. 📚 Log Enhancer
+- **Enhance your logs** before they go into your SIEM or log analysis engine.
+- **Enrich with the latest IOCs** Query IP2Proxy database, OTX, and AbuseIPDB
+- **Find threats faster** Enrich your logs before processing, saving time and effort and unnecessary overhead doing post-ingestion lookups.
+
 ---
 
 ## 🖥️ System Requirements
@@ -246,6 +251,8 @@ DFIRVault/
 │   └── executable_path (REG_SZ)
 ├── Thor/
 │   └── executable_path (REG_SZ)
+├── LogEnhancer/
+│   └── executable_path (REG_SZ)
 ├── Splunk/
 │   ├── splunk_path (REG_SZ)
 │   ├── username (REG_SZ)
@@ -280,6 +287,7 @@ reg import DFIRVault_backup.reg
 | **CSV upload fails** | Check Elasticsearch cluster health and credentials |
 | **VaultMirror task not created** | Run as Administrator and check Task Scheduler service |
 | **Registry access denied** | Ensure you have write permissions to HKCU |
+
 
 ### Log Files
 - **Case Manager**: `[CaseFolder]/case_manager.log`
