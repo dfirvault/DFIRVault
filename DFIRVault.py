@@ -12,6 +12,7 @@ Sections:
   6. CSV → ELK               — upload CSV data to Elasticsearch
   7. SFTP/FTP Monitor        — bidirectional file-sync monitoring
   8. VaultMirror             — safe scheduled sync via Windows Task Scheduler
+  9. CSV Log Enricher        — enrich CSV logs with OTX / AbuseIPDB / IP2Location / Tor
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -21,7 +22,6 @@ import os
 import re
 import json
 import sys
-import json
 import math
 import time
 import shutil
@@ -42,12 +42,148 @@ from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# ── LogEnricher additional imports ────────────────────────────────
+import csv
+import ipaddress
+import zipfile
+import tempfile
+import struct
+import socket
+import pickle
+from typing import Dict, List, Set, Tuple, Optional, Any
+from urllib.parse import urlparse
+from collections import defaultdict
+from io import StringIO
+
+try:
+    import requests as _le_requests
+    from rich.console import Console as _LE_Console
+    from rich.progress import Progress as _LE_Progress
+    from rich.panel import Panel as _LE_Panel
+    _LE_IMPORTS_OK = True
+except ImportError:
+    _LE_IMPORTS_OK = False
+
 if IS_WINDOWS:
     try:
         import colorama
         colorama.init(autoreset=True)
     except ImportError:
         pass
+    try:
+        import winreg
+    except ImportError:
+        pass
+
+# ──────────────────────────────────────────────────────────────────
+# REGISTRY CONFIGURATION MANAGER
+# ──────────────────────────────────────────────────────────────────
+REGISTRY_PATH = r"Software\DFIRVault"
+
+class RegistryConfig:
+    """Manages configuration storage in Windows registry"""
+    
+    @staticmethod
+    def _get_registry_key(subkey=""):
+        """Open or create registry key"""
+        full_path = REGISTRY_PATH
+        if subkey:
+            full_path = f"{REGISTRY_PATH}\\{subkey}"
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, full_path)
+            return key
+        except Exception as e:
+            print(f"Registry error: {e}")
+            return None
+    
+    @staticmethod
+    def save_config(section, key, value):
+        """Save a configuration value to registry"""
+        if not IS_WINDOWS:
+            return False
+        try:
+            key_handle = RegistryConfig._get_registry_key(section)
+            if key_handle:
+                # Convert value to appropriate type
+                if isinstance(value, str):
+                    winreg.SetValueEx(key_handle, key, 0, winreg.REG_SZ, value)
+                elif isinstance(value, int):
+                    winreg.SetValueEx(key_handle, key, 0, winreg.REG_DWORD, value)
+                elif isinstance(value, bool):
+                    winreg.SetValueEx(key_handle, key, 0, winreg.REG_DWORD, 1 if value else 0)
+                elif isinstance(value, dict) or isinstance(value, list):
+                    winreg.SetValueEx(key_handle, key, 0, winreg.REG_SZ, json.dumps(value))
+                else:
+                    winreg.SetValueEx(key_handle, key, 0, winreg.REG_SZ, str(value))
+                winreg.CloseKey(key_handle)
+                return True
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+        return False
+    
+    @staticmethod
+    def load_config(section, key, default=None):
+        """Load a configuration value from registry"""
+        if not IS_WINDOWS:
+            return default
+        try:
+            key_handle = RegistryConfig._get_registry_key(section)
+            if key_handle:
+                value, reg_type = winreg.QueryValueEx(key_handle, key)
+                winreg.CloseKey(key_handle)
+                
+                # Try to parse JSON if it looks like a dict/list
+                if reg_type == winreg.REG_SZ and isinstance(value, str):
+                    if value.startswith('{') or value.startswith('['):
+                        try:
+                            return json.loads(value)
+                        except:
+                            pass
+                return value
+        except FileNotFoundError:
+            return default
+        except Exception as e:
+            print(f"Failed to load config: {e}")
+            return default
+    
+    @staticmethod
+    def delete_config(section, key):
+        """Delete a configuration value from registry"""
+        if not IS_WINDOWS:
+            return False
+        try:
+            key_handle = RegistryConfig._get_registry_key(section)
+            if key_handle:
+                winreg.DeleteValue(key_handle, key)
+                winreg.CloseKey(key_handle)
+                return True
+        except:
+            pass
+        return False
+    
+    @staticmethod
+    def list_section(section):
+        """List all keys in a registry section"""
+        if not IS_WINDOWS:
+            return []
+        try:
+            key_handle = RegistryConfig._get_registry_key(section)
+            if key_handle:
+                keys = []
+                i = 0
+                while True:
+                    try:
+                        name = winreg.EnumValue(key_handle, i)[0]
+                        keys.append(name)
+                        i += 1
+                    except OSError:
+                        break
+                winreg.CloseKey(key_handle)
+                return keys
+            return []
+        except:
+            return []
+
 
 # ──────────────────────────────────────────────────────────────────
 # GLOBAL UI HELPERS
@@ -137,7 +273,6 @@ def yesno_dialog(title, message):
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 1 — DFIR CASE MANAGER
 # ══════════════════════════════════════════════════════════════════
-CASE_CONFIG = "case_config.txt"
 
 def _case_7zip():
     if getattr(sys, "frozen", False):
@@ -150,14 +285,20 @@ def _case_7zip():
     return default if os.path.exists(default) else None
 
 def _case_read_backup():
-    if os.path.exists(CASE_CONFIG):
-        loc = open(CASE_CONFIG).read().strip()
-        if os.path.isdir(loc):
-            return loc
-    return None
+    """Read backup location from registry"""
+    return RegistryConfig.load_config("CaseManager", "backup_location", "")
 
 def _case_write_backup(path):
-    open(CASE_CONFIG, "w").write(path.strip())
+    """Write backup location to registry"""
+    RegistryConfig.save_config("CaseManager", "backup_location", path)
+
+def _case_read_case_folder():
+    """Read case folder location from registry"""
+    return RegistryConfig.load_config("CaseManager", "case_folder", "")
+
+def _case_write_case_folder(folder_path):
+    """Write case folder location to registry"""
+    RegistryConfig.save_config("CaseManager", "case_folder", folder_path)
 
 def case_create(case_folder):
     subheader("Create New Case")
@@ -247,76 +388,6 @@ def case_archive(backup_location, case_folder):
         shutil.make_archive(os.path.splitext(zip_path)[0], "zip", target_path)
         ok(f"Archived (no password) → {zip_path}")
 
-def _case_read_case_folder():
-    """Read the case folder location from config file"""
-    if os.path.exists(CASE_CONFIG):
-        try:
-            with open(CASE_CONFIG, 'r') as f:
-                data = f.read().strip()
-                # Check if it's JSON format or old format
-                if data.startswith('{'):
-                    config = json.loads(data)
-                    return config.get('case_folder', '')
-                else:
-                    # Old format - just backup location
-                    return ''
-        except:
-            return ''
-    return ''
-
-def _case_write_case_folder(folder_path):
-    """Write case folder location to config file, preserving backup location"""
-    backup_loc = _case_read_backup()
-    config = {
-        'case_folder': folder_path,
-        'backup_location': backup_loc if backup_loc else ''
-    }
-    with open(CASE_CONFIG, 'w') as f:
-        json.dump(config, f, indent=2)
-
-def _case_update_config(backup_loc=None, case_folder=None):
-    """Update config with new values while preserving existing ones"""
-    config = {}
-    if os.path.exists(CASE_CONFIG):
-        try:
-            with open(CASE_CONFIG, 'r') as f:
-                content = f.read().strip()
-                if content.startswith('{'):
-                    config = json.loads(content)
-                else:
-                    # Old format - convert to new
-                    config['backup_location'] = content
-        except:
-            pass
-    
-    if backup_loc is not None:
-        config['backup_location'] = backup_loc
-    if case_folder is not None:
-        config['case_folder'] = case_folder
-    
-    with open(CASE_CONFIG, 'w') as f:
-        json.dump(config, f, indent=2)
-
-def _case_read_backup():
-    """Read backup location from config (backward compatible)"""
-    if os.path.exists(CASE_CONFIG):
-        try:
-            with open(CASE_CONFIG, 'r') as f:
-                content = f.read().strip()
-                if content.startswith('{'):
-                    config = json.loads(content)
-                    return config.get('backup_location', '')
-                else:
-                    return content
-        except:
-            return ''
-    return ''
-
-def _case_write_backup(path):
-    """Write backup location to config (backward compatible)"""
-    case_folder = _case_read_case_folder()
-    _case_update_config(backup_loc=path, case_folder=case_folder)
-
 def case_change_case_folder():
     """Change the case folder location"""
     info("Select new case folder location…")
@@ -392,14 +463,11 @@ def menu_case_manager():
             r = case_change_case_folder()
             if r:
                 case_folder = r
-                # Update backup location preservation
-                _case_update_config(backup_loc=backup, case_folder=case_folder)
                 
         elif ch == "4":
             r = case_change_backup()
             if r:
                 backup = r
-                _case_update_config(backup_loc=backup, case_folder=case_folder)
                 
         elif ch == "5":
             if case_folder and os.path.exists(case_folder):
@@ -424,7 +492,6 @@ def menu_case_manager():
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 2 — HAYABUSA SCANNER
 # ══════════════════════════════════════════════════════════════════
-HAYABUSA_CONFIG = "hayabusa-config.txt"
 
 def _hayabusa_find_evtx(start):
     folders = []
@@ -435,15 +502,19 @@ def _hayabusa_find_evtx(start):
     return folders
 
 def _hayabusa_load_path():
-    if os.path.exists(HAYABUSA_CONFIG):
-        p = open(HAYABUSA_CONFIG).readline().strip()
-        if p and os.path.exists(p):
-            return p
+    """Load Hayabusa path from registry"""
+    path = RegistryConfig.load_config("Hayabusa", "executable_path", "")
+    if path and os.path.exists(path):
+        return path
     defaults = [r"C:\Tools\Hayabusa\hayabusa.exe", "hayabusa.exe"]
     for d in defaults:
         if os.path.exists(d):
             return os.path.abspath(d)
     return ""
+
+def _hayabusa_save_path(path):
+    """Save Hayabusa path to registry"""
+    RegistryConfig.save_config("Hayabusa", "executable_path", path)
 
 def _hayabusa_pick_path():
     p = pick_file("Select Hayabusa executable",
@@ -533,8 +604,7 @@ def menu_hayabusa():
         hayabusa_path = _hayabusa_pick_path()
         if not hayabusa_path:
             err("No executable selected."); pause(); return
-    with open(HAYABUSA_CONFIG, "w") as f:
-        f.write(hayabusa_path)
+    _hayabusa_save_path(hayabusa_path)
     while True:
         header("HAYABUSA EVENT LOG SCANNER")
         info(f"Binary: {hayabusa_path}")
@@ -551,21 +621,24 @@ def menu_hayabusa():
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 3 — CHAINSAW SCANNER
 # ══════════════════════════════════════════════════════════════════
-CHAINSAW_CONFIG = "chainsaw-config.txt"
 
 def _chainsaw_find_evtx(start):
     return _hayabusa_find_evtx(start)   # same logic
 
 def _chainsaw_load_path():
-    if os.path.exists(CHAINSAW_CONFIG):
-        p = open(CHAINSAW_CONFIG).readline().strip()
-        if p and os.path.exists(p):
-            return p
+    """Load Chainsaw path from registry"""
+    path = RegistryConfig.load_config("Chainsaw", "executable_path", "")
+    if path and os.path.exists(path):
+        return path
     defaults = [r"C:\Tools\Chainsaw\chainsaw_x86_64-pc-windows-msvc.exe", "chainsaw.exe"]
     for d in defaults:
         if os.path.exists(d):
             return os.path.abspath(d)
     return ""
+
+def _chainsaw_save_path(path):
+    """Save Chainsaw path to registry"""
+    RegistryConfig.save_config("Chainsaw", "executable_path", path)
 
 def _chainsaw_pick_path():
     return pick_file("Select Chainsaw executable",
@@ -657,8 +730,7 @@ def menu_chainsaw():
         chainsaw_path = _chainsaw_pick_path()
         if not chainsaw_path:
             err("No executable selected."); pause(); return
-    with open(CHAINSAW_CONFIG, "w") as f:
-        f.write(chainsaw_path)
+    _chainsaw_save_path(chainsaw_path)
     while True:
         header("CHAINSAW EVENT LOG SCANNER")
         info(f"Binary: {chainsaw_path}")
@@ -675,7 +747,6 @@ def menu_chainsaw():
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 4 — THOR SCANNER
 # ══════════════════════════════════════════════════════════════════
-THOR_CONFIG = "thor-config.txt"
 
 def _thor_is_running():
     try:
@@ -718,15 +789,19 @@ def _thor_get_drives():
     return drives
 
 def _thor_load_path():
-    if os.path.exists(THOR_CONFIG):
-        p = open(THOR_CONFIG).readline().strip()
-        if p and os.path.exists(p):
-            return p
+    """Load Thor path from registry"""
+    path = RegistryConfig.load_config("Thor", "executable_path", "")
+    if path and os.path.exists(path):
+        return path
     defaults = [r"C:\Tools\Thor\thor64-lite.exe", "thor64-lite.exe", "thor-lite.exe"]
     for d in defaults:
         if os.path.exists(d):
             return os.path.abspath(d)
     return ""
+
+def _thor_save_path(path):
+    """Save Thor path to registry"""
+    RegistryConfig.save_config("Thor", "executable_path", path)
 
 def menu_thor():
     if IS_WINDOWS and not ctypes.windll.shell32.IsUserAnAdmin():
@@ -744,8 +819,7 @@ def menu_thor():
             err("No executable selected."); pause(); return
         if os.path.isdir(thor_path):
             thor_path = os.path.join(thor_path, "thor64-lite.exe")
-    with open(THOR_CONFIG, "w") as f:
-        f.write(thor_path)
+    _thor_save_path(thor_path)
     thor_dir = os.path.dirname(os.path.abspath(thor_path))
 
     # Update signatures
@@ -837,7 +911,6 @@ def menu_thor():
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 5 — SPLUNK INDEX MANAGER
 # ══════════════════════════════════════════════════════════════════
-SPLUNK_CONFIG = "splunk_config.json"
 DEFAULT_SPLUNK_PATHS = [
     "/opt/splunk/bin/splunk",
     r"C:\Program Files\Splunk\bin\splunk.exe",
@@ -853,13 +926,11 @@ class SplunkManager:
         self._verify()
 
     def _load_config(self):
-        if os.path.exists(SPLUNK_CONFIG):
-            try:
-                cfg = json.load(open(SPLUNK_CONFIG))
-                self.splunk_path = cfg.get("splunk_path", "")
-                self.username    = cfg.get("username", "")
-                self.password    = cfg.get("password", "")
-            except: pass
+        """Load Splunk config from registry"""
+        self.splunk_path = RegistryConfig.load_config("Splunk", "splunk_path", "")
+        self.username = RegistryConfig.load_config("Splunk", "username", "")
+        self.password = RegistryConfig.load_config("Splunk", "password", "")
+        
         if not self.splunk_path or not os.path.exists(self.splunk_path):
             self._pick_splunk_path()
         if not self.username or not self.password:
@@ -867,9 +938,10 @@ class SplunkManager:
         self._save_config()
 
     def _save_config(self):
-        json.dump({"splunk_path": self.splunk_path, "username": self.username,
-                   "password": self.password},
-                  open(SPLUNK_CONFIG, "w"), indent=2)
+        """Save Splunk config to registry"""
+        RegistryConfig.save_config("Splunk", "splunk_path", self.splunk_path)
+        RegistryConfig.save_config("Splunk", "username", self.username)
+        RegistryConfig.save_config("Splunk", "password", self.password)
 
     def _pick_splunk_path(self):
         root = tk.Tk(); root.withdraw()
@@ -1303,7 +1375,6 @@ def menu_splunk():
 # ══════════════════════════════════════════════════════════════════
 #  SECTION 6 — CSV → ELASTICSEARCH (CSV2ELK)
 # ══════════════════════════════════════════════════════════════════
-ELK_CONFIG = "elk_config.json"
 
 # Lazy-import pandas and requests only when this section runs
 def _elk_load_heavy():
@@ -1317,15 +1388,19 @@ def _elk_load_heavy():
         return None, None
 
 def _elk_load_config():
-    if os.path.exists(ELK_CONFIG):
-        try:
-            return json.load(open(ELK_CONFIG))
-        except: pass
-    return {"url": "", "username": "", "password": ""}
+    """Load ELK config from registry"""
+    config = {
+        "url": RegistryConfig.load_config("Elasticsearch", "url", ""),
+        "username": RegistryConfig.load_config("Elasticsearch", "username", ""),
+        "password": RegistryConfig.load_config("Elasticsearch", "password", "")
+    }
+    return config
 
 def _elk_save_config(url, user, pw):
-    json.dump({"url": url, "username": user, "password": pw},
-              open(ELK_CONFIG, "w"), indent=2)
+    """Save ELK config to registry"""
+    RegistryConfig.save_config("Elasticsearch", "url", url)
+    RegistryConfig.save_config("Elasticsearch", "username", user)
+    RegistryConfig.save_config("Elasticsearch", "password", pw)
 
 def _elk_ensure_connection(cfg, req):
     url, user, pw = cfg["url"], cfg["username"], cfg["password"]
@@ -2334,6 +2409,790 @@ def menu_vault_mirror():
 
 
 # ══════════════════════════════════════════════════════════════════
+#  SECTION 9 — CSV LOG ENRICHER
+# ══════════════════════════════════════════════════════════════════
+
+LE_REG_SECTION = "LogEnricher"
+LE_CACHE_DIR   = os.path.join(os.path.expanduser("~"), ".log_enricher_cache")
+
+
+def _le_ensure_imports():
+    """Ensure rich/requests are available, install if needed."""
+    global _LE_IMPORTS_OK, _le_requests, _LE_Console, _LE_Progress, _LE_Panel
+    if _LE_IMPORTS_OK:
+        return True
+    try:
+        os.system("pip install rich requests")
+        import requests as _le_requests
+        from rich.console import Console as _LE_Console
+        from rich.progress import Progress as _LE_Progress
+        from rich.panel import Panel as _LE_Panel
+        _LE_IMPORTS_OK = True
+        return True
+    except Exception as e:
+        err(f"Could not install required packages: {e}")
+        return False
+
+
+# ── Registry helpers using DFIRVault's RegistryConfig ─────────────
+
+def _le_load_config() -> dict:
+    """Load LogEnricher config from registry under DFIRVault key."""
+    return {
+        "otx_key":            RegistryConfig.load_config(LE_REG_SECTION, "otx_key", ""),
+        "ip2location_token":  RegistryConfig.load_config(LE_REG_SECTION, "ip2location_token", ""),
+        "abuseipdb_key":      RegistryConfig.load_config(LE_REG_SECTION, "abuseipdb_key", ""),
+        "otx_enabled":        bool(RegistryConfig.load_config(LE_REG_SECTION, "otx_enabled", 1)),
+        "geolocation_enabled":bool(RegistryConfig.load_config(LE_REG_SECTION, "geolocation_enabled", 1)),
+        "abuseipdb_enabled":  bool(RegistryConfig.load_config(LE_REG_SECTION, "abuseipdb_enabled", 1)),
+        "tor_enabled":        bool(RegistryConfig.load_config(LE_REG_SECTION, "tor_enabled", 1)),
+        "last_input_path":    RegistryConfig.load_config(LE_REG_SECTION, "last_input_path", ""),
+        "last_output_path":   RegistryConfig.load_config(LE_REG_SECTION, "last_output_path", ""),
+    }
+
+
+def _le_save_config(config: dict):
+    """Save LogEnricher config to registry under DFIRVault key."""
+    for key, value in config.items():
+        if value is None:
+            value = ""
+        RegistryConfig.save_config(LE_REG_SECTION, key, value)
+
+
+# ── Indicator Extractor ───────────────────────────────────────────
+
+import re as _re
+
+class _LE_IndicatorExtractor:
+    IP_PATTERN = _re.compile(
+        r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+    )
+    HASH_PATTERNS = {
+        'md5':    _re.compile(r'\b[a-fA-F0-9]{32}\b'),
+        'sha1':   _re.compile(r'\b[a-fA-F0-9]{40}\b'),
+        'sha256': _re.compile(r'\b[a-fA-F0-9]{64}\b'),
+    }
+    DOMAIN_PATTERN = _re.compile(
+        r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b'
+    )
+    URL_PATTERN = _re.compile(
+        r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?::\d+)?'
+        r'(?:/[-\w%!$&\'()*+,;=:@/~.]*)?(?:\?[-\w%!$&\'()*+,;=:@/~]*)?'
+        r'(?:#[-\w%!$&\'()*+,;=:@/~]*)?'
+    )
+
+    @classmethod
+    def extract(cls, text: str) -> dict:
+        indicators = {'ips': [], 'hashes': [], 'domains': [], 'urls': []}
+        if not text:
+            return indicators
+        text = str(text)
+        indicators['ips']  = cls.IP_PATTERN.findall(text)
+        for pattern in cls.HASH_PATTERNS.values():
+            indicators['hashes'].extend(pattern.findall(text))
+        indicators['urls'] = cls.URL_PATTERN.findall(text)
+        domains = cls.DOMAIN_PATTERN.findall(text)
+        common_tlds = {'.com','.org','.net','.gov','.edu','.io','.co','.uk',
+                       '.us','.de','.jp','.fr','.au','.br','.ca','.cn','.ru',
+                       '.in','.info','.biz'}
+        for domain in domains:
+            if any(domain.lower().endswith(t) for t in common_tlds):
+                if not any(domain in u for u in indicators['urls']):
+                    indicators['domains'].append(domain)
+        return indicators
+
+
+# ── OTX Enricher ─────────────────────────────────────────────────
+
+class _LE_OTXEnricher:
+    def __init__(self, api_key: str):
+        self.api_key  = api_key
+        self.base_url = "https://otx.alienvault.com/api/v1"
+        self.headers  = {"X-OTX-API-KEY": api_key}
+        self.cache    = {}
+
+    def enrich(self, indicator_type: str, indicator: str) -> dict:
+        key = f"{indicator_type}:{indicator}"
+        if key in self.cache:
+            return self.cache[key]
+        empty = {'otx_threat_score':0,'otx_pulse_count':0,'otx_malicious_pulses':0,
+                 'otx_pulse_names':'','otx_tags':'','otx_malicious':False,'otx_found':False}
+        try:
+            url = f"{self.base_url}/indicators/{indicator_type}/{indicator}/general"
+            r   = _le_requests.get(url, headers=self.headers, timeout=30)
+            if r.status_code == 200:
+                data   = r.json()
+                pulses = data.get('pulse_info',{}).get('pulses',[])
+                count  = data.get('pulse_info',{}).get('count',0)
+                names, tags, mal = [], set(), 0
+                for p in pulses[:10]:
+                    n = p.get('name','')
+                    if n: names.append(n[:100])
+                    tags.update(p.get('tags',[]))
+                    if p.get('is_malicious'): mal += 1
+                result = {
+                    'otx_threat_score':     min(100, count * 10),
+                    'otx_pulse_count':      count,
+                    'otx_malicious_pulses': mal,
+                    'otx_pulse_names':      ' | '.join(names[:5]),
+                    'otx_tags':             ', '.join(list(tags)[:15]),
+                    'otx_malicious':        mal > 0,
+                    'otx_found':            True,
+                }
+                self.cache[key] = result
+                return result
+            elif r.status_code == 404:
+                self.cache[key] = empty
+                return empty
+        except Exception as e:
+            pass
+        return empty
+
+
+# ── IP2Location PX12 Enricher ─────────────────────────────────────
+
+class _LE_IP2LocationEnricher:
+    def __init__(self, token: str):
+        self.token       = token
+        self.db_path     = None
+        self.ip_ranges   = []
+        self.cache       = {}
+        self.cache_dir   = LE_CACHE_DIR
+        self.db_cache    = os.path.join(self.cache_dir, "ip2location_px12_db.pkl")
+        self.meta_file   = os.path.join(self.cache_dir, "ip2location_px12_metadata.json")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._console    = _LE_Console()
+
+    def check_cache(self):
+        if os.path.exists(self.meta_file):
+            try:
+                with open(self.meta_file) as f:
+                    meta = json.load(f)
+                age = datetime.now() - datetime.fromisoformat(meta.get('download_date','2000-01-01'))
+                if age.days < 30 and os.path.exists(self.db_cache):
+                    return True, meta
+            except:
+                pass
+        return False, None
+
+    def load_cache(self):
+        try:
+            self._console.print("[cyan]Loading cached IP2Location PX12 database...[/cyan]")
+            with open(self.db_cache,'rb') as f:
+                self.ip_ranges = pickle.load(f)
+            self._console.print(f"[green]Loaded {len(self.ip_ranges):,} IP ranges from cache[/green]")
+            return True
+        except Exception as e:
+            self._console.print(f"[red]Failed to load cached database: {e}[/red]")
+            return False
+
+    def save_cache(self):
+        try:
+            with open(self.db_cache,'wb') as f:
+                pickle.dump(self.ip_ranges, f, pickle.HIGHEST_PROTOCOL)
+            meta = {
+                'download_date': datetime.now().isoformat(),
+                'record_count':  len(self.ip_ranges),
+                'token_hash':    hashlib.md5(self.token.encode()).hexdigest()[:8]
+            }
+            with open(self.meta_file,'w') as f:
+                json.dump(meta, f)
+        except Exception as e:
+            self._console.print(f"[yellow]Failed to cache database: {e}[/yellow]")
+
+    def download(self, force=False):
+        try:
+            url = f"https://www.ip2location.com/download?token={self.token}&file=PX12LITECSV"
+            self._console.print("[cyan]Downloading IP2Location PX12 LITE Proxy database...[/cyan]")
+            r = _le_requests.get(url, stream=True, timeout=60)
+            if r.status_code != 200:
+                self._console.print(f"[red]Failed to download: HTTP {r.status_code}[/red]")
+                return False
+            tmp = tempfile.mkdtemp()
+            zp  = os.path.join(tmp, "ip2location.zip")
+            total = int(r.headers.get('content-length',0))
+            with _LE_Progress() as progress:
+                task = progress.add_task("[cyan]Downloading...", total=total)
+                with open(zp,'wb') as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                        progress.advance(task, len(chunk))
+            with zipfile.ZipFile(zp,'r') as z:
+                z.extractall(tmp)
+            for root, dirs, files in os.walk(tmp):
+                for fn in files:
+                    if fn.endswith('.csv'):
+                        self.db_path = os.path.join(root, fn)
+                        break
+                if self.db_path:
+                    break
+            if not self.db_path:
+                return False
+            self._load_db()
+            self.save_cache()
+            return True
+        except Exception as e:
+            self._console.print(f"[red]Error downloading database: {e}[/red]")
+            return False
+
+    @staticmethod
+    def _ip_to_int(ip: str) -> int:
+        try:
+            return int(ipaddress.IPv4Address(ip))
+        except:
+            try:
+                parts = ip.split('.')
+                if len(parts) == 4:
+                    return (int(parts[0])<<24)+(int(parts[1])<<16)+(int(parts[2])<<8)+int(parts[3])
+            except:
+                pass
+        return 0
+
+    def _load_db(self):
+        self.ip_ranges = []
+        self._console.print("[cyan]Parsing IP2Location PX12 database...[/cyan]")
+        for enc in ['utf-8','latin-1','iso-8859-1','cp1252']:
+            try:
+                with open(self.db_path,'r',encoding=enc,errors='ignore') as f:
+                    sample = [f.readline() for _ in range(5)]
+                    f.seek(0)
+                    has_hdr = any('ip_from' in l.lower() for l in sample)
+                    if has_hdr:
+                        next(f)
+                    total = sum(1 for _ in f)
+                    f.seek(0)
+                    if has_hdr:
+                        next(f)
+                    reader = csv.reader(f)
+                    with _LE_Progress() as progress:
+                        task = progress.add_task("[cyan]Parsing...", total=total)
+                        for row in reader:
+                            progress.advance(task)
+                            if len(row) >= 15:
+                                try:
+                                    ifs = row[0].strip().strip('"')
+                                    its = row[1].strip().strip('"')
+                                    ip_from = self._ip_to_int(ifs) if '.' in ifs else int(float(ifs))
+                                    ip_to   = self._ip_to_int(its) if '.' in its else int(float(its))
+                                    if ip_from > 0 and ip_to >= ip_from:
+                                        self.ip_ranges.append({
+                                            'ip_from': ip_from, 'ip_to': ip_to,
+                                            'country_code': row[2].strip('"'),
+                                            'country_name': row[3].strip('"'),
+                                            'region_name':  row[4].strip('"'),
+                                            'city_name':    row[5].strip('"'),
+                                            'isp':          row[6].strip('"'),
+                                            'domain':       row[7].strip('"'),
+                                            'usage_type':   row[8].strip('"'),
+                                            'asn':          row[9].strip('"'),
+                                            'as_name':      row[10].strip('"'),
+                                            'proxy_type':   row[11].strip('"'),
+                                            'threat':       row[12].strip('"'),
+                                            'provider':     row[13].strip('"'),
+                                            'fraud_score':  row[14].strip('"'),
+                                        })
+                                except (ValueError, IndexError):
+                                    pass
+                if self.ip_ranges:
+                    self.ip_ranges.sort(key=lambda x: x['ip_from'])
+                    self._console.print(f"[green]Database ready: {len(self.ip_ranges):,} ranges[/green]")
+                    return
+            except Exception:
+                continue
+
+    def lookup(self, ip: str) -> dict:
+        if ip in self.cache:
+            return self.cache[ip]
+        empty = {
+            'geo_country_code':'','geo_country_name':'','geo_region':'','geo_city':'',
+            'geo_isp':'','geo_domain':'','proxy_usage_type':'','proxy_asn':'',
+            'proxy_as_name':'','proxy_type':'','proxy_threat':'','proxy_provider':'',
+            'proxy_fraud_score':'','geo_found':False,'is_proxy':False,'is_vpn':False,
+            'is_hosting':False,'is_tor':False
+        }
+        if not self.ip_ranges:
+            self.cache[ip] = empty
+            return empty
+        try:
+            ip_int = self._ip_to_int(ip)
+            if not ip_int:
+                self.cache[ip] = empty
+                return empty
+            lo, hi = 0, len(self.ip_ranges)-1
+            while lo <= hi:
+                mid = (lo+hi)//2
+                r   = self.ip_ranges[mid]
+                if r['ip_from'] <= ip_int <= r['ip_to']:
+                    result = {
+                        'geo_country_code': r['country_code'],
+                        'geo_country_name': r['country_name'],
+                        'geo_region':       r['region_name'],
+                        'geo_city':         r['city_name'],
+                        'geo_isp':          r['isp'],
+                        'geo_domain':       r['domain'],
+                        'proxy_usage_type': r['usage_type'],
+                        'proxy_asn':        r['asn'],
+                        'proxy_as_name':    r['as_name'],
+                        'proxy_type':       r['proxy_type'],
+                        'proxy_threat':     r['threat'],
+                        'proxy_provider':   r['provider'],
+                        'proxy_fraud_score':r['fraud_score'],
+                        'geo_found':        True,
+                        'is_proxy':  r['proxy_type'] not in ['','-','NON-PROXY'],
+                        'is_vpn':    'VPN' in r['usage_type'].upper() if r['usage_type'] else False,
+                        'is_hosting':'DCH' in r['usage_type'].upper() if r['usage_type'] else False,
+                        'is_tor':    'TOR' in r['proxy_type'].upper() if r['proxy_type'] else False,
+                    }
+                    self.cache[ip] = result
+                    return result
+                elif ip_int < r['ip_from']:
+                    hi = mid-1
+                else:
+                    lo = mid+1
+        except Exception:
+            pass
+        self.cache[ip] = empty
+        return empty
+
+
+# ── AbuseIPDB Enricher ────────────────────────────────────────────
+
+class _LE_AbuseIPDBEnricher:
+    def __init__(self, api_key: str):
+        self.api_key  = api_key
+        self.base_url = "https://api.abuseipdb.com/api/v2"
+        self.cache    = {}
+
+    def check(self, ip: str) -> dict:
+        if ip in self.cache:
+            return self.cache[ip]
+        empty = {'abuse_confidence_score':0,'abuse_total_reports':0,'abuse_last_reported':'',
+                 'abuse_country':'','abuse_usage_type':'','abuse_isp':'','abuse_domain':'',
+                 'abuse_is_whitelisted':False,'abuse_found':False}
+        try:
+            r = _le_requests.get(
+                f"{self.base_url}/check",
+                headers={'Key': self.api_key, 'Accept': 'application/json'},
+                params={'ipAddress': ip, 'maxAgeInDays': 90, 'verbose': ''},
+                timeout=10
+            )
+            if r.status_code == 200:
+                d = r.json().get('data',{})
+                result = {
+                    'abuse_confidence_score': d.get('abuseConfidenceScore',0),
+                    'abuse_total_reports':    d.get('totalReports',0),
+                    'abuse_last_reported':    (d.get('lastReportedAt','') or '')[:10],
+                    'abuse_country':          d.get('countryCode',''),
+                    'abuse_usage_type':       d.get('usageType',''),
+                    'abuse_isp':              d.get('isp',''),
+                    'abuse_domain':           d.get('domain',''),
+                    'abuse_is_whitelisted':   d.get('isWhitelisted',False),
+                    'abuse_found':            d.get('totalReports',0) > 0,
+                }
+                self.cache[ip] = result
+                return result
+        except Exception:
+            pass
+        self.cache[ip] = empty
+        return empty
+
+
+# ── Tor Exit Node Checker ─────────────────────────────────────────
+
+class _LE_TorChecker:
+    def __init__(self):
+        self._console  = _LE_Console()
+        self.exit_nodes: set = set()
+        self._cache_file = os.path.join(LE_CACHE_DIR, "tor_exit_nodes.pkl")
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self._cache_file):
+            try:
+                if time.time() - os.path.getmtime(self._cache_file) < 86400:
+                    with open(self._cache_file,'rb') as f:
+                        self.exit_nodes = pickle.load(f)
+                    self._console.print(f"[green]Loaded {len(self.exit_nodes):,} Tor exit nodes from cache[/green]")
+                    return
+            except:
+                pass
+        try:
+            r = _le_requests.get("https://check.torproject.org/exit-addresses", timeout=10)
+            if r.status_code == 200:
+                for line in r.text.split('\n'):
+                    if line.startswith('ExitAddress'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            self.exit_nodes.add(parts[1])
+                os.makedirs(LE_CACHE_DIR, exist_ok=True)
+                with open(self._cache_file,'wb') as f:
+                    pickle.dump(self.exit_nodes, f)
+                self._console.print(f"[green]Downloaded {len(self.exit_nodes):,} Tor exit nodes[/green]")
+        except Exception as e:
+            self._console.print(f"[yellow]Could not load Tor exit nodes: {e}[/yellow]")
+
+    def is_tor(self, ip: str) -> bool:
+        return ip in self.exit_nodes
+
+
+# ── CSV Log Enricher Engine ───────────────────────────────────────
+
+class _LE_Enricher:
+    def __init__(self, config: dict):
+        self._console  = _LE_Console()
+        self.config    = config
+        self.otx       = _LE_OTXEnricher(config['otx_key'])      if config.get('otx_enabled') and config.get('otx_key') else None
+        self.abuseipdb = _LE_AbuseIPDBEnricher(config['abuseipdb_key']) if config.get('abuseipdb_enabled') and config.get('abuseipdb_key') else None
+        self.tor       = _LE_TorChecker()                         if config.get('tor_enabled') else None
+        self.ip2loc    = None
+
+        if config.get('geolocation_enabled') and config.get('ip2location_token'):
+            self.ip2loc = _LE_IP2LocationEnricher(config['ip2location_token'])
+            has_cache, meta = self.ip2loc.check_cache()
+            if has_cache:
+                info(f"Cached IP2Location database found  (downloaded: {meta.get('download_date','?')[:10]}, records: {meta.get('record_count',0):,})")
+                ch = prompt("Update IP2Location database now? (y/n, recommended every 30 days):").strip().lower()
+                if ch.startswith('y'):
+                    if not self.ip2loc.download():
+                        warn("Update failed — using cached version.")
+                        if not self.ip2loc.load_cache():
+                            err("Failed to load any database. Geolocation disabled.")
+                            self.ip2loc = None
+                else:
+                    if not self.ip2loc.load_cache():
+                        err("Failed to load cached database. Geolocation disabled.")
+                        self.ip2loc = None
+            else:
+                warn("No cached database found — downloading now...")
+                if not self.ip2loc.download():
+                    err("Download failed. Geolocation disabled.")
+                    self.ip2loc = None
+
+    def process(self, input_path: str, output_path: str) -> bool:
+        try:
+            self._console.print(f"\n[bold cyan]Processing: {Path(input_path).name}[/bold cyan]")
+            rows, fieldnames = self._read_csv(input_path)
+            if not rows:
+                self._console.print("[yellow]No data found[/yellow]")
+                return False
+            self._console.print(f"[dim]Read {len(rows)} rows, {len(fieldnames)} columns[/dim]")
+            unique = self._extract_unique(rows)
+            enriched = self._enrich_all(unique)
+            out_rows = self._apply(rows, enriched)
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            self._write_csv(output_path, out_rows, fieldnames)
+            if os.path.exists(output_path):
+                self._console.print(f"[green]✓ Saved: {output_path} ({os.path.getsize(output_path):,} bytes)[/green]")
+                return True
+            return False
+        except Exception as e:
+            self._console.print(f"[red]Error: {e}[/red]")
+            import traceback; traceback.print_exc()
+            return False
+
+    def _read_csv(self, path: str):
+        for enc in ['utf-8','utf-8-sig','latin-1','iso-8859-1','cp1252']:
+            try:
+                with open(path,'r',encoding=enc,errors='ignore') as f:
+                    sample = f.read(4096); f.seek(0)
+                    try:
+                        dialect  = csv.Sniffer().sniff(sample)
+                        has_hdr  = csv.Sniffer().has_header(sample)
+                    except:
+                        dialect = 'excel'; has_hdr = True
+                    if has_hdr:
+                        reader = csv.DictReader(f, dialect=dialect)
+                        fieldnames = list(reader.fieldnames) if reader.fieldnames else []
+                        rows = list(reader)
+                    else:
+                        reader = csv.reader(f, dialect=dialect)
+                        try:
+                            first = next(reader)
+                            fieldnames = [f"Column_{i+1}" for i in range(len(first))]
+                            f.seek(0)
+                            reader = csv.DictReader(f, fieldnames=fieldnames, dialect=dialect)
+                            rows = list(reader)
+                        except StopIteration:
+                            rows = []
+                    if rows:
+                        return rows, fieldnames
+            except:
+                continue
+        return [], []
+
+    def _extract_unique(self, rows):
+        unique = {'ips':set(),'hashes':set(),'domains':set(),'urls':set()}
+        self._console.print("[cyan]Extracting indicators...[/cyan]")
+        with _LE_Progress() as progress:
+            task = progress.add_task("[cyan]Scanning rows...", total=len(rows))
+            for row in rows:
+                txt = ' '.join(str(v) for v in row.values() if v)
+                ind = _LE_IndicatorExtractor.extract(txt)
+                for k in unique:
+                    unique[k].update(ind[k])
+                progress.advance(task)
+        self._console.print(f"[green]Unique indicators — IPs:{len(unique['ips'])} "
+                             f"Hashes:{len(unique['hashes'])} "
+                             f"Domains:{len(unique['domains'])} "
+                             f"URLs:{len(unique['urls'])}[/green]")
+        return unique
+
+    def _enrich_all(self, unique):
+        enriched = {}
+        if unique['ips']:
+            self._console.print(f"\n[cyan]Enriching {len(unique['ips'])} IPs...[/cyan]")
+            with _LE_Progress() as progress:
+                task = progress.add_task("[cyan]IPs...", total=len(unique['ips']))
+                for ip in unique['ips']:
+                    enriched[ip] = self._enrich_ip(ip)
+                    progress.advance(task)
+                    time.sleep(0.05)
+        for kind, otype in [('domains','domain'),('urls','url'),('hashes','file')]:
+            if unique[kind] and self.otx:
+                self._console.print(f"\n[cyan]Enriching {len(unique[kind])} {kind} via OTX...[/cyan]")
+                with _LE_Progress() as progress:
+                    task = progress.add_task(f"[cyan]{kind}...", total=len(unique[kind]))
+                    for val in unique[kind]:
+                        enriched[val] = self.otx.enrich(otype, val)
+                        progress.advance(task)
+                        time.sleep(0.05)
+        return enriched
+
+    def _enrich_ip(self, ip: str) -> dict:
+        data = {'ip': ip}
+        if self.ip2loc:
+            data.update(self.ip2loc.lookup(ip))
+        if self.otx:
+            data.update(self.otx.enrich('IPv4', ip))
+        if self.abuseipdb:
+            data.update(self.abuseipdb.check(ip))
+        if self.tor:
+            data['is_tor_exit_node'] = self.tor.is_tor(ip)
+        score = 0
+        if data.get('otx_malicious'):               score += 30
+        if data.get('abuse_confidence_score',0)>50: score += 30
+        if data.get('is_proxy'):                    score += 20
+        if data.get('is_tor') or data.get('is_tor_exit_node'): score += 20
+        if data.get('is_vpn'):                      score += 15
+        if data.get('is_hosting'):                  score += 10
+        data['combined_threat_score'] = min(100, score)
+        return data
+
+    def _apply(self, rows, enriched):
+        self._console.print("\n[cyan]Applying enrichments to rows...[/cyan]")
+        out = []
+        with _LE_Progress() as progress:
+            task = progress.add_task("[cyan]Rows...", total=len(rows))
+            for row in rows:
+                er   = row.copy()
+                txt  = ' '.join(str(v) for v in row.values() if v)
+                ind  = _LE_IndicatorExtractor.extract(txt)
+                cnt  = defaultdict(int)
+                for ip in ind['ips']:
+                    if ip in enriched:
+                        cnt['ip'] += 1
+                        sfx = f"_{cnt['ip']}" if cnt['ip'] > 1 else ""
+                        for k,v in enriched[ip].items():
+                            if k != 'ip': er[f"{k}{sfx}"] = v
+                for domain in ind['domains']:
+                    if domain in enriched:
+                        cnt['domain'] += 1
+                        sfx = f"_{cnt['domain']}" if cnt['domain'] > 1 else ""
+                        for k,v in enriched[domain].items():
+                            er[f"{k}_domain{sfx}"] = v
+                for url in ind['urls']:
+                    if url in enriched:
+                        cnt['url'] += 1
+                        sfx = f"_{cnt['url']}" if cnt['url'] > 1 else ""
+                        for k,v in enriched[url].items():
+                            er[f"{k}_url{sfx}"] = v
+                for h in ind['hashes']:
+                    if h in enriched:
+                        cnt['hash'] += 1
+                        sfx = f"_{cnt['hash']}" if cnt['hash'] > 1 else ""
+                        for k,v in enriched[h].items():
+                            er[f"{k}_hash{sfx}"] = v
+                out.append(er)
+                progress.advance(task)
+        return out
+
+    def _write_csv(self, path, rows, orig_fields):
+        all_fields = set()
+        for f in orig_fields:
+            if f is not None: all_fields.add(str(f))
+        for row in rows:
+            for k in row:
+                if k is not None: all_fields.add(str(k))
+        orig_set  = {str(f) for f in orig_fields if f is not None}
+        new_fields = sorted([f for f in all_fields if f not in orig_set])
+        final     = [f for f in orig_fields if f is not None] + new_fields
+        with open(path,'w',encoding='utf-8',newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=final, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
+        self._console.print(f"[dim]Output: {len(final)} columns[/dim]")
+
+
+# ── Menu Entry Point ──────────────────────────────────────────────
+
+def menu_log_enricher():
+    if not _le_ensure_imports():
+        pause(); return
+
+    header("CSV LOG ENRICHER")
+
+    # Load existing config from registry
+    saved = _le_load_config()
+    has_config = bool(saved.get('otx_key') or saved.get('ip2location_token') or saved.get('abuseipdb_key'))
+
+    config = dict(saved)  # start with saved values
+
+    if has_config:
+        subheader("Saved API Configuration Found")
+        info(f"OTX key:           {'[set]' if saved.get('otx_key') else '[not set]'}")
+        info(f"IP2Location token: {'[set]' if saved.get('ip2location_token') else '[not set]'}")
+        info(f"AbuseIPDB key:     {'[set]' if saved.get('abuseipdb_key') else '[not set]'}")
+        info(f"Enrichments:       OTX={saved.get('otx_enabled',True)}  "
+             f"Geo={saved.get('geolocation_enabled',True)}  "
+             f"AbuseIPDB={saved.get('abuseipdb_enabled',True)}  "
+             f"Tor={saved.get('tor_enabled',True)}")
+        print()
+        ch = prompt("Keep existing API configuration? (y=keep / n=update):").strip().lower()
+        update_config = ch.startswith('n')
+    else:
+        update_config = True
+
+    if update_config:
+        subheader("API Configuration")
+
+        # OTX
+        default_otx = saved.get('otx_key','')
+        raw = prompt(f"AlienVault OTX API key [{('****' + default_otx[-4:]) if default_otx else 'not set'}] (Enter to keep):").strip()
+        if raw:
+            config['otx_key'] = raw
+        elif not config.get('otx_key'):
+            config['otx_key'] = ''
+
+        # IP2Location
+        default_ip2l = saved.get('ip2location_token','')
+        raw = prompt(f"IP2Location download token [{('****' + default_ip2l[-4:]) if default_ip2l else 'not set'}] (Enter to keep, 'none' to clear):").strip()
+        if raw.lower() == 'none':
+            config['ip2location_token'] = ''
+        elif raw:
+            config['ip2location_token'] = raw
+
+        # AbuseIPDB
+        default_abuse = saved.get('abuseipdb_key','')
+        raw = prompt(f"AbuseIPDB API key [{('****' + default_abuse[-4:]) if default_abuse else 'not set'}] (Enter to keep, 'none' to clear):").strip()
+        if raw.lower() == 'none':
+            config['abuseipdb_key'] = ''
+        elif raw:
+            config['abuseipdb_key'] = raw
+
+        # Enrichment toggles
+        subheader("Enrichment Options")
+        otx_on = prompt(f"Enable OTX threat intelligence? (y/n) [current: {'y' if config.get('otx_enabled',True) else 'n'}]:").strip().lower()
+        if otx_on in ('y','n'):
+            config['otx_enabled'] = otx_on == 'y'
+
+        if config.get('ip2location_token'):
+            geo_on = prompt(f"Enable IP2Location geolocation + proxy? (y/n) [current: {'y' if config.get('geolocation_enabled',True) else 'n'}]:").strip().lower()
+            if geo_on in ('y','n'):
+                config['geolocation_enabled'] = geo_on == 'y'
+        else:
+            config['geolocation_enabled'] = False
+
+        if config.get('abuseipdb_key'):
+            abuse_on = prompt(f"Enable AbuseIPDB reputation? (y/n) [current: {'y' if config.get('abuseipdb_enabled',True) else 'n'}]:").strip().lower()
+            if abuse_on in ('y','n'):
+                config['abuseipdb_enabled'] = abuse_on == 'y'
+        else:
+            config['abuseipdb_enabled'] = False
+
+        tor_on = prompt(f"Enable Tor exit node detection? (y/n) [current: {'y' if config.get('tor_enabled',True) else 'n'}]:").strip().lower()
+        if tor_on in ('y','n'):
+            config['tor_enabled'] = tor_on == 'y'
+
+        _le_save_config(config)
+        ok("Configuration saved to registry.")
+
+    if not config.get('otx_key') and not config.get('ip2location_token') and not config.get('abuseipdb_key'):
+        warn("No API keys configured. At least one enrichment source is recommended.")
+        if not prompt("Continue anyway? (y/n):").strip().lower().startswith('y'):
+            return
+
+    # File selection
+    subheader("File Selection")
+    print(f"  {_c(C.CYAN,'[1]')} Single CSV file")
+    print(f"  {_c(C.CYAN,'[2]')} Folder with multiple CSV files")
+    print(f"  {_c(C.RED, '[0]')} Back")
+    divider()
+    ch = prompt("Choice:").strip()
+    if ch == '0':
+        return
+    elif ch == '1':
+        info("Select CSV file to enrich…")
+        input_path = pick_file("Select CSV file", [("CSV files", "*.csv"), ("All files", "*.*")])
+        if not input_path:
+            warn("No file selected."); return
+        files_to_process = [input_path]
+        save_input = input_path
+    elif ch == '2':
+        info("Select folder containing CSV files…")
+        input_path = pick_folder("Select folder with CSV files")
+        if not input_path:
+            warn("No folder selected."); return
+        files_to_process = [str(f) for f in Path(input_path).glob("*.csv")]
+        if not files_to_process:
+            err("No CSV files found in selected folder."); pause(); return
+        ok(f"Found {len(files_to_process)} CSV file(s).")
+        save_input = input_path
+    else:
+        err("Invalid choice."); return
+
+    # Output directory
+    subheader("Output Configuration")
+    default_out = config.get('last_output_path','')
+    info("Select output directory…")
+    output_path = pick_folder("Select output directory")
+    if not output_path:
+        warn("No output directory selected."); return
+
+    # Save paths to registry
+    config['last_input_path']  = save_input
+    config['last_output_path'] = output_path
+    _le_save_config(config)
+
+    os.makedirs(LE_CACHE_DIR, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
+
+    # Initialise enricher
+    subheader("Initialising Enricher")
+    enricher = _LE_Enricher(config)
+
+    # Process files
+    subheader("Enrichment Processing")
+    successful = failed = 0
+    for fpath in files_to_process:
+        stem      = Path(fpath).stem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_file  = os.path.join(output_path, f"{stem}_enriched_{timestamp}.csv")
+        if enricher.process(fpath, out_file):
+            successful += 1
+        else:
+            failed += 1
+
+    print()
+    ok(f"Processing complete — {successful} succeeded, {failed} failed.")
+    info(f"Output directory: {output_path}")
+    if IS_WINDOWS:
+        try: os.startfile(os.path.abspath(output_path))
+        except: pass
+    pause()
+
+
+# ══════════════════════════════════════════════════════════════════
 #  MAIN MENU
 # ══════════════════════════════════════════════════════════════════
 BANNER = f"""
@@ -2351,6 +3210,10 @@ BANNER = f"""
 
 
 def main():
+    if not IS_WINDOWS:
+        err("This tool is designed for Windows systems only.")
+        sys.exit(1)
+    
     clear_screen()
     print(BANNER)
     while True:
@@ -2372,6 +3235,9 @@ def main():
         print(f"  {_c(C.CYAN,'[7]')} SFTP / FTP Monitor")
         print(f"  {_c(C.CYAN,'[8]')} VaultMirror  {_c(C.DIM,'safe scheduled sync')}")
         print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── THREAT INTELLIGENCE ────────────────────')}")
+        print(f"  {_c(C.CYAN,'[9]')} CSV Log Enricher  {_c(C.DIM,'enrich logs with OTX / AbuseIPDB / IP2Location / Tor')}")
+        print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         divider()
         choice = prompt("Select section:").strip()
@@ -2383,10 +3249,11 @@ def main():
         elif choice == "6": clear_screen(); menu_csv2elk()
         elif choice == "7": clear_screen(); menu_sftp()
         elif choice == "8": clear_screen(); menu_vault_mirror()
+        elif choice == "9": clear_screen(); menu_log_enricher()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-8 or 0.")
+            err("Invalid choice. Enter 1-9 or 0.")
         clear_screen()
         print(BANNER)
 
