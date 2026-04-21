@@ -16,6 +16,8 @@
 
 ---
 
+<img width="671" height="517" alt="image" src="https://github.com/user-attachments/assets/05fe4809-e942-4878-9394-e547796ec38e" />
+
 ## 🚀 Overview
 
 **DFIRVault** is a comprehensive, all-in-one console application designed for Digital Forensics and Incident Response (DFIR) professionals. It consolidates multiple essential DFIR tools into a single, unified interface, streamlining your investigative workflow and eliminating the need to juggle between different applications.
@@ -86,6 +88,10 @@ Developed by a DFIR practitioner for DFIR practitioners, DFIRVault integrates ca
 - **Enhance your logs** before they go into your SIEM or log analysis engine.
 - **Enrich with the latest IOCs** Query IP2Proxy database, OTX, and AbuseIPDB
 - **Find threats faster** Enrich your logs before processing, saving time and effort and unnecessary overhead doing post-ingestion lookups.
+
+### 10. ⚡ Body file to CSV
+- **Convert bodyfile to csv** in preparation for super timelining and importing into your local log analysis platform (Splunk, Elastic, Opensearch)
+- **Additional HTML report ** with interactive filters for fast timelining triage and analysis
 
 ---
 
