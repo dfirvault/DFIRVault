@@ -91,7 +91,7 @@ Developed by a DFIR practitioner for DFIR practitioners, DFIRVault integrates ca
 
 ### 10. ⚡ Body file to CSV
 - **Convert bodyfile to csv** in preparation for super timelining and importing into your local log analysis platform (Splunk, Elastic, Opensearch)
-- **Additional HTML report ** with interactive filters for fast timelining triage and analysis
+- **Additional HTML report** with interactive filters for fast timelining triage and analysis
 
 ---
 
