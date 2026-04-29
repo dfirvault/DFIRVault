@@ -14,6 +14,8 @@ Sections:
   8. VaultMirror             — safe scheduled sync via Windows Task Scheduler
   9. CSV Log Enricher        — enrich CSV logs with OTX / AbuseIPDB / IP2Location / Tor
   10. Body file to CSV       — convert a body file to CSV
+  11. CSV Splitter           — split large CSV files by size or line count
+  12. CSV Timestamp Cleaner  — normalise timestamps to DD/MM/YYYY HH:MM:SS
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -65,6 +67,18 @@ try:
     _LE_IMPORTS_OK = True
 except ImportError:
     _LE_IMPORTS_OK = False
+
+try:
+    import pandas as _pd
+    _PANDAS_OK = True
+except ImportError:
+    _PANDAS_OK = False
+
+try:
+    from tqdm import tqdm as _tqdm
+    _TQDM_OK = True
+except ImportError:
+    _TQDM_OK = False
 
 if IS_WINDOWS:
     try:
@@ -1871,188 +1885,593 @@ def _sftp_get_pw_masked(msg="Password: "):
     return getpass.getpass(f"  {_c(C.MAGENTA, C.ARROW)} {msg}")
 
 
-def _sftp_monitor_remote(config, client_cls, tqdm):
-    interval = config.get("interval", 60)
-    subheader("REMOTE Monitoring Active")
-    info("Watching remote server for changes — downloading to local folder.")
-    info(f"Base interval: {interval}s  |  Remote: {config['remote_folder']}")
-    info(f"Local: {config['local_folder']}")
-    log_dir = os.path.join(config["local_folder"], "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"sftp_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
-    logger = logging.getLogger("sftp_remote")
-    ftp = client_cls(config["host"], config["username"], config["password"],
-                     config.get("port", 22), config.get("use_sftp", True))
-    if not ftp.connect(): return
-    os.makedirs(config["local_folder"], exist_ok=True)
-    file_states = {}
-    no_change_count = 0
-    current_int = 5
-    try:
-        while True:
-            changes = False
-            try:
-                remote_files = ftp.list_files(config["remote_folder"])
-                for fn in remote_files:
-                    if fn in [".", ".."]: continue
-                    rpath = os.path.join(config["remote_folder"], fn).replace("\\", "/")
-                    lpath = os.path.join(config["local_folder"], fn)
-                    cur_size = ftp.get_file_size(rpath)
-                    if fn not in file_states:
-                        info(f"New file: {fn}")
-                        if ftp.download_file(rpath, lpath, logger, tqdm):
-                            file_states[fn] = {"size": cur_size}; changes = True
-                    elif file_states[fn]["size"] != cur_size:
-                        warn(f"Changed: {fn}")
-                        if ftp.download_file(rpath, lpath, logger, tqdm):
-                            file_states[fn] = {"size": cur_size}; changes = True
-                for fn in list(file_states):
-                    if fn not in remote_files:
-                        lpath = os.path.join(config["local_folder"], fn)
-                        if os.path.exists(lpath): os.remove(lpath)
-                        del file_states[fn]; changes = True
-                        info(f"Deleted locally: {fn}")
-            except Exception as e:
-                err(f"Monitoring error: {e}")
-                ftp.disconnect(); time.sleep(5)
-                if not ftp.connect(): break
-                file_states = {}
-            if changes:
-                no_change_count = 0; current_int = 5
-            else:
-                no_change_count += 1
-                current_int = 5 if no_change_count <= 3 else (15 if no_change_count <= 6 else interval)
-            for remaining in range(current_int, 0, -1):
-                print(f"\r  {_c(C.DIM, f'Next check in {remaining}s...')}", end="", flush=True)
-                time.sleep(1)
-            print("\r" + " " * 50 + "\r", end="")
-    except KeyboardInterrupt:
-        info("Monitoring stopped by user.")
-    finally:
-        ftp.disconnect()
+
+# ── SFTP background-sync infrastructure ──────────────────────────
+SFTP_BASE  = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "DFIRVault" / "SFTPMonitor"
+SFTP_SCRI  = SFTP_BASE / "scripts"
+SFTP_LOGS  = SFTP_BASE / "logs"
+SFTP_JOBS  = SFTP_BASE / "jobs.json"
+for _sp in [SFTP_BASE, SFTP_SCRI, SFTP_LOGS]:
+    _sp.mkdir(parents=True, exist_ok=True)
 
 
-def _sftp_monitor_local(config, client_cls, Observer, FileSystemEventHandler, tqdm):
-    interval = config.get("interval", 60)
-    subheader("LOCAL Monitoring Active")
-    info("Watching local folder for changes — uploading to remote server.")
-    log_dir = os.path.join(config["local_folder"], "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"sftp_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
-    logger = logging.getLogger("sftp_local")
-    ftp = client_cls(config["host"], config["username"], config["password"],
-                     config.get("port", 22), config.get("use_sftp", True))
-    if not ftp.connect(): return
+def _sftp_jobs_load():
+    if SFTP_JOBS.exists():
+        try: return json.loads(SFTP_JOBS.read_text(encoding="utf-8"))
+        except: pass
+    return {}
 
-    class Handler(FileSystemEventHandler):
-        def _do_upload(self, src):
-            if not os.path.exists(src): return
-            fn = os.path.basename(src)
-            rp = os.path.join(config["remote_folder"], fn).replace("\\", "/")
-            time.sleep(1)
-            ftp.upload_file(src, rp, logger, tqdm)
-        def on_created(self, e):
-            if not e.is_directory: self._do_upload(e.src_path)
-        def on_modified(self, e):
-            if not e.is_directory:
-                threading.Timer(2.0, self._do_upload, [e.src_path]).start()
-        def on_deleted(self, e):
-            if not e.is_directory:
-                fn = os.path.basename(e.src_path)
-                rp = os.path.join(config["remote_folder"], fn).replace("\\", "/")
-                try:
-                    (ftp.sftp.remove if ftp.use_sftp else ftp.connection.delete)(rp)
-                    info(f"Deleted remotely: {fn}"); logger.info(f"DELETED REMOTELY: {fn}")
-                except Exception as ex:
-                    err(f"Remote delete failed: {ex}")
 
-    # Initial sync
-    local_files = [f for f in os.listdir(config["local_folder"]) if os.path.isfile(os.path.join(config["local_folder"], f))]
-    if local_files:
-        info(f"Initial upload of {len(local_files)} file(s)…")
-        for fn in local_files:
-            lp = os.path.join(config["local_folder"], fn)
-            rp = os.path.join(config["remote_folder"], fn).replace("\\", "/")
-            ftp.upload_file(lp, rp, logger, tqdm)
+def _sftp_jobs_save(jobs):
+    SFTP_JOBS.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
 
-    observer = Observer()
-    observer.schedule(Handler(), config["local_folder"], recursive=False)
-    observer.start()
-    ok("Monitoring local folder. Press Ctrl+C to stop.")
-    try:
-        while True: time.sleep(1)
-    except KeyboardInterrupt:
-        info("Monitoring stopped by user.")
-    finally:
-        observer.stop(); observer.join(); ftp.disconnect()
+
+def _sftp_make_sync_script(job_name, cfg):
+    """Generate a self-contained Python sync script for Task Scheduler to run."""
+    script_path   = SFTP_SCRI / f"sftp_sync_{job_name}.py"
+    log_file      = str(SFTP_LOGS / f"{job_name}.log")
+    direction     = cfg["direction"]
+    h             = cfg["host"]
+    p             = cfg["port"]
+    u             = cfg["username"]
+    pw            = cfg["password"]
+    use_sftp      = cfg["use_sftp"]
+    rf            = cfg["remote_folder"]
+    lf            = cfg["local_folder"]
+    ts            = datetime.now().isoformat(timespec="seconds")
+    dir_desc      = "server -> local" if direction == "remote" else "local -> server"
+
+    lines = []
+    lines.append('#!/usr/bin/env python3')
+    lines.append(f'"""DFIRVault SFTP background sync -- {job_name}  Generated: {ts}  Direction: {dir_desc}"""')
+    lines.append('import os, sys, logging, json, stat as _stat')
+    lines.append('from pathlib import Path')
+    lines.append(f'LOG_FILE     = {repr(log_file)}')
+    lines.append(f'HOST         = {repr(h)}')
+    lines.append(f'PORT         = {p}')
+    lines.append(f'USERNAME     = {repr(u)}')
+    lines.append(f'PASSWORD     = {repr(pw)}')
+    lines.append(f'USE_SFTP     = {use_sftp}')
+    lines.append(f'REMOTE_DIR   = {repr(rf)}')
+    lines.append(f'LOCAL_DIR    = {repr(lf)}')
+    lines.append(f'DIRECTION    = {repr(direction)}')
+    lines.append(f'LOCK_FILE    = {repr(str(SFTP_SCRI / (job_name + ".lock")))}')
+    lines.append('')
+    lines.append('logging.basicConfig(')
+    lines.append('    level=logging.INFO,')
+    lines.append('    format="%(asctime)s  %(levelname)-8s  %(message)s",')
+    lines.append('    datefmt="%Y-%m-%d %H:%M:%S",')
+    lines.append('    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],')
+    lines.append(')')
+    lines.append('log = logging.getLogger("sftp_sync")')
+    lines.append('')
+    lines.append('def connect_sftp():')
+    lines.append('    import paramiko')
+    lines.append('    t = paramiko.Transport((HOST, PORT))')
+    lines.append('    t.connect(username=USERNAME, password=PASSWORD)')
+    lines.append('    return t, paramiko.SFTPClient.from_transport(t)')
+    lines.append('')
+    lines.append('def remote_walk_sftp(sftp, remote_path):')
+    lines.append('    def _walk(rdir, rel_prefix):')
+    lines.append('        try: items = sftp.listdir_attr(rdir)')
+    lines.append('        except Exception as exc: log.warning(f"Cannot list {rdir}: {exc}"); return')
+    lines.append('        for attr in items:')
+    lines.append('            name = attr.filename')
+    lines.append('            if name in (".", ".."): continue')
+    lines.append('            abs_path = rdir.rstrip("/") + "/" + name')
+    lines.append('            rel_path = (rel_prefix + "/" + name).lstrip("/")')
+    lines.append('            if _stat.S_ISDIR(attr.st_mode): yield from _walk(abs_path, rel_path)')
+    lines.append('            else: yield rel_path, abs_path, attr.st_size')
+    lines.append('    yield from _walk(remote_path, "")')
+    lines.append('')
+    lines.append('def sftp_mkdir_p(sftp, remote_dir):')
+    lines.append('    parts = remote_dir.strip("/").split("/")')
+    lines.append('    cur = ""')
+    lines.append('    for part in parts:')
+    lines.append('        cur += "/" + part')
+    lines.append('        try: sftp.stat(cur)')
+    lines.append('        except IOError:')
+    lines.append('            try: sftp.mkdir(cur)')
+    lines.append('            except: pass')
+    lines.append('')
+    lines.append('def sync_remote_to_local():')
+    lines.append('    """Sync from remote server to local machine - checks file sizes for changes"""')
+    lines.append('    log.info("=== sync_remote_to_local START ===")')
+    lines.append('    changed = 0')
+    lines.append('    try:')
+    lines.append('        transport, sftp = connect_sftp()')
+    lines.append('    except Exception as exc:')
+    lines.append('        log.error(f"Connection failed: {exc}")')
+    lines.append('        return')
+    lines.append('    ')
+    lines.append('    # State file stores file sizes from last sync')
+    lines.append('    state_file = Path(LOCAL_DIR) / ".sftp_state.json"')
+    lines.append('    state = {}')
+    lines.append('    if state_file.exists():')
+    lines.append('        try:')
+    lines.append('            state = json.loads(state_file.read_text())')
+    lines.append('            log.info(f"Loaded previous state with {len(state)} files")')
+    lines.append('        except Exception as exc:')
+    lines.append('            log.warning(f"Could not load state file: {exc}")')
+    lines.append('    ')
+    lines.append('    new_state = {}')
+    lines.append('    files_checked = 0')
+    lines.append('    files_downloaded = 0')
+    lines.append('    files_deleted = 0')
+    lines.append('    ')
+    lines.append('    try:')
+    lines.append('        # First, collect all remote files and their sizes')
+    lines.append('        remote_files = {}')
+    lines.append('        log.info(f"Scanning remote directory: {REMOTE_DIR}")')
+    lines.append('        ')
+    lines.append('        for rel, abs_remote, size in remote_walk_sftp(sftp, REMOTE_DIR):')
+    lines.append('            remote_files[rel] = size')
+    lines.append('            files_checked += 1')
+    lines.append('            ')
+    lines.append('            # Get local file path')
+    lines.append('            local_path = Path(LOCAL_DIR) / rel')
+    lines.append('            ')
+    lines.append('            # Check if file needs to be downloaded')
+    lines.append('            should_download = False')
+    lines.append('            ')
+    lines.append('            if rel not in state:')
+    lines.append('                # New file on remote')
+    lines.append('                log.info(f"New remote file detected: {rel} ({size} bytes)")')
+    lines.append('                should_download = True')
+    lines.append('            elif state.get(rel, {}).get("size") != size:')
+    lines.append('                # File size has changed')
+    lines.append('                old_size = state.get(rel, {}).get("size", 0)')
+    lines.append('                log.info(f"Changed remote file: {rel} ({old_size} -> {size} bytes)")')
+    lines.append('                should_download = True')
+    lines.append('            elif not local_path.exists():')
+    lines.append('                # File exists in state but missing locally')
+    lines.append('                log.info(f"Missing local file, re-downloading: {rel}")')
+    lines.append('                should_download = True')
+    lines.append('            ')
+    lines.append('            if should_download:')
+    lines.append('                try:')
+    lines.append('                    local_path.parent.mkdir(parents=True, exist_ok=True)')
+    lines.append('                    sftp.get(abs_remote, str(local_path))')
+    lines.append('                    log.info(f"DOWNLOADED {rel} ({size} bytes)")')
+    lines.append('                    files_downloaded += 1')
+    lines.append('                    changed += 1')
+    lines.append('                except Exception as exc:')
+    lines.append('                    log.error(f"DOWNLOAD FAILED {rel}: {exc}")')
+    lines.append('                    continue')
+    lines.append('            ')
+    lines.append('            # Store current file info in new state')
+    lines.append('            new_state[rel] = {"size": size}')
+    lines.append('        ')
+    lines.append('        log.info(f"Remote scan complete: {files_checked} files checked, {files_downloaded} downloaded")')
+    lines.append('        ')
+    lines.append('        # Check for files that exist locally but not on remote (should be deleted)')
+    lines.append('        for rel in list(state.keys()):')
+    lines.append('            if rel not in remote_files:')
+    lines.append('                local_path = Path(LOCAL_DIR) / rel')
+    lines.append('                if local_path.exists():')
+    lines.append('                    try:')
+    lines.append('                        local_path.unlink()')
+    lines.append('                        log.info(f"DELETED LOCAL (no longer on remote): {rel}")')
+    lines.append('                        files_deleted += 1')
+    lines.append('                        changed += 1')
+    lines.append('                        # Clean up empty directories')
+    lines.append('                        parent = local_path.parent')
+    lines.append('                        while parent != Path(LOCAL_DIR) and parent.exists() and not any(parent.iterdir()):')
+    lines.append('                            parent.rmdir()')
+    lines.append('                            parent = parent.parent')
+    lines.append('                    except Exception as exc:')
+    lines.append('                        log.warning(f"Could not delete local file {rel}: {exc}")')
+    lines.append('        ')
+    lines.append('        # Save the new state')
+    lines.append('        state_file.write_text(json.dumps(new_state, indent=2))')
+    lines.append('        log.info(f"State saved: {len(new_state)} files tracked")')
+    lines.append('        ')
+    lines.append('        if files_deleted > 0:')
+    lines.append('            log.info(f"Deleted {files_deleted} local files no longer on remote")')
+    lines.append('            ')
+    lines.append('    except Exception as exc:')
+    lines.append('        log.error(f"Sync error: {exc}")')
+    lines.append('        import traceback')
+    lines.append('        log.error(traceback.format_exc())')
+    lines.append('    finally:')
+    lines.append('        try:')
+    lines.append('            sftp.close()')
+    lines.append('            transport.close()')
+    lines.append('        except:')
+    lines.append('            pass')
+    lines.append('    ')
+    lines.append('    log.info(f"=== sync_remote_to_local END -- {changed} change(s) (downloaded: {files_downloaded}, deleted: {files_deleted}) ===")')
+    lines.append('')
+    lines.append('def sync_local_to_remote():')
+    lines.append('    """Sync from local machine to remote server - checks file sizes and modification times for changes"""')
+    lines.append('    log.info("=== sync_local_to_remote START ===")')
+    lines.append('    changed = 0')
+    lines.append('    try:')
+    lines.append('        transport, sftp = connect_sftp()')
+    lines.append('    except Exception as exc:')
+    lines.append('        log.error(f"Connection failed: {exc}")')
+    lines.append('        return')
+    lines.append('    ')
+    lines.append('    # State file stores file mtime and size from last sync')
+    lines.append('    state_file = Path(LOCAL_DIR) / ".sftp_state.json"')
+    lines.append('    state = {}')
+    lines.append('    if state_file.exists():')
+    lines.append('        try:')
+    lines.append('            state = json.loads(state_file.read_text())')
+    lines.append('            log.info(f"Loaded previous state with {len(state)} files")')
+    lines.append('        except Exception as exc:')
+    lines.append('            log.warning(f"Could not load state file: {exc}")')
+    lines.append('    ')
+    lines.append('    new_state = {}')
+    lines.append('    files_checked = 0')
+    lines.append('    files_uploaded = 0')
+    lines.append('    files_deleted = 0')
+    lines.append('    ')
+    lines.append('    try:')
+    lines.append('        local_root = Path(LOCAL_DIR)')
+    lines.append('        ')
+    lines.append('        # First, collect all local files with their mtime and size')
+    lines.append('        local_files = {}')
+    lines.append('        for local_path in local_root.rglob("*"):')
+    lines.append('            if not local_path.is_file():')
+    lines.append('                continue')
+    lines.append('            if local_path.name == ".sftp_state.json":')
+    lines.append('                continue')
+    lines.append('            ')
+    lines.append('            rel = local_path.relative_to(local_root).as_posix()')
+    lines.append('            mtime = local_path.stat().st_mtime')
+    lines.append('            size = local_path.stat().st_size')
+    lines.append('            local_files[rel] = {"mtime": mtime, "size": size}')
+    lines.append('            files_checked += 1')
+    lines.append('            ')
+    lines.append('            # Check if file needs to be uploaded')
+    lines.append('            should_upload = False')
+    lines.append('            ')
+    lines.append('            if rel not in state:')
+    lines.append('                # New file locally')
+    lines.append('                log.info(f"New local file detected: {rel} ({size} bytes)")')
+    lines.append('                should_upload = True')
+    lines.append('            elif state[rel].get("mtime") != mtime or state[rel].get("size") != size:')
+    lines.append('                # File has changed')
+    lines.append('                old_mtime = state[rel].get("mtime", 0)')
+    lines.append('                old_size = state[rel].get("size", 0)')
+    lines.append('                log.info(f"Changed local file: {rel} (mtime: {old_mtime}->{mtime}, size: {old_size}->{size})")')
+    lines.append('                should_upload = True')
+    lines.append('            ')
+    lines.append('            if should_upload:')
+    lines.append('                remote_path = REMOTE_DIR.rstrip("/") + "/" + rel')
+    lines.append('                remote_parent = remote_path.rsplit("/", 1)[0]')
+    lines.append('                ')
+    lines.append('                try:')
+    lines.append('                    # Ensure remote directory exists')
+    lines.append('                    sftp_mkdir_p(sftp, remote_parent)')
+    lines.append('                    ')
+    lines.append('                    # Upload the file')
+    lines.append('                    sftp.put(str(local_path), remote_path)')
+    lines.append('                    log.info(f"UPLOADED {rel} ({size} bytes)")')
+    lines.append('                    files_uploaded += 1')
+    lines.append('                    changed += 1')
+    lines.append('                except Exception as exc:')
+    lines.append('                    log.error(f"UPLOAD FAILED {rel}: {exc}")')
+    lines.append('            ')
+    lines.append('            # Store current file info in new state')
+    lines.append('            new_state[rel] = {"mtime": mtime, "size": size}')
+    lines.append('        ')
+    lines.append('        log.info(f"Local scan complete: {files_checked} files checked, {files_uploaded} uploaded")')
+    lines.append('        ')
+    lines.append('        # Check for files that exist remotely but not locally (should be deleted)')
+    lines.append('        remote_files = set()')
+    lines.append('        ')
+    lines.append('        # Get all remote files to compare')
+    lines.append('        try:')
+    lines.append('            for rel, abs_remote, size in remote_walk_sftp(sftp, REMOTE_DIR):')
+    lines.append('                remote_files.add(rel)')
+    lines.append('        except Exception as exc:')
+    lines.append('            log.warning(f"Could not scan remote files for cleanup: {exc}")')
+    lines.append('        ')
+    lines.append('        # Delete remote files that no longer exist locally')
+    lines.append('        for rel in list(state.keys()):')
+    lines.append('            if rel not in local_files and rel in remote_files:')
+    lines.append('                remote_path = REMOTE_DIR.rstrip("/") + "/" + rel')
+    lines.append('                try:')
+    lines.append('                    sftp.remove(remote_path)')
+    lines.append('                    log.info(f"DELETED REMOTE (no longer local): {rel}")')
+    lines.append('                    files_deleted += 1')
+    lines.append('                    changed += 1')
+    lines.append('                except Exception as exc:')
+    lines.append('                    log.warning(f"Could not delete remote file {rel}: {exc}")')
+    lines.append('        ')
+    lines.append('        # Save the new state')
+    lines.append('        state_file.write_text(json.dumps(new_state, indent=2))')
+    lines.append('        log.info(f"State saved: {len(new_state)} files tracked")')
+    lines.append('        ')
+    lines.append('        if files_deleted > 0:')
+    lines.append('            log.info(f"Deleted {files_deleted} remote files no longer local")')
+    lines.append('            ')
+    lines.append('    except Exception as exc:')
+    lines.append('        log.error(f"Sync error: {exc}")')
+    lines.append('        import traceback')
+    lines.append('        log.error(traceback.format_exc())')
+    lines.append('    finally:')
+    lines.append('        try:')
+    lines.append('            sftp.close()')
+    lines.append('            transport.close()')
+    lines.append('        except:')
+    lines.append('            pass')
+    lines.append('    ')
+    lines.append('    log.info(f"=== sync_local_to_remote END -- {changed} change(s) (uploaded: {files_uploaded}, deleted: {files_deleted}) ===")')
+    lines.append('')
+    lines.append('if __name__ == "__main__":')
+    lines.append('    import time as _time')
+    lines.append('    lk = Path(LOCK_FILE)')
+    lines.append('    # Stale lock guard: if lock is older than 4 hours, consider it abandoned')
+    lines.append('    STALE_HOURS = 4')
+    lines.append('    if lk.exists():')
+    lines.append('        age = _time.time() - lk.stat().st_mtime')
+    lines.append('        if age < STALE_HOURS * 3600:')
+    lines.append('            log.info(f"SKIPPED -- sync already running (lock age {age:.0f}s)")')
+    lines.append('            sys.exit(0)')
+    lines.append('        else:')
+    lines.append('            log.warning(f"Stale lock detected ({age/3600:.1f}h old) -- removing and proceeding")')
+    lines.append('            lk.unlink()')
+    lines.append('    try:')
+    lines.append('        lk.write_text(str(os.getpid()))')
+    lines.append('        if DIRECTION == "remote": sync_remote_to_local()')
+    lines.append('        else: sync_local_to_remote()')
+    lines.append('    finally:')
+    lines.append('        if lk.exists(): lk.unlink()')
+
+    script_path.write_text('\n'.join(lines), encoding="utf-8")
+    return script_path
+
+def _sftp_register_task(job_name, script_path, interval_key):
+    task_name = f"dfirvault-sftp-{job_name}"
+    imap = {
+        "1": ("MINUTE", "1",  "Every minute"),
+        "2": ("MINUTE", "5",  "Every 5 minutes"),
+        "3": ("MINUTE", "15", "Every 15 minutes"),
+        "4": ("HOURLY", "1",  "Hourly"),
+        "5": ("DAILY",  "1",  "Daily"),
+    }
+    sch, mod, _ = imap.get(interval_key, ("MINUTE", "5", "Every 5 minutes"))
+    exe = sys.executable
+    cmd = [
+        "schtasks", "/Create", "/TN", task_name,
+        "/TR", f'"{exe}" "{script_path}"',
+        "/SC", sch, "/MO", mod, "/F",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+    return res.returncode == 0
+
+
+def _sftp_delete_task(job_name):
+    task_name = f"dfirvault-sftp-{job_name}"
+    subprocess.run(f'schtasks /Delete /TN "{task_name}" /F',
+                   shell=True, capture_output=True)
+    sp = SFTP_SCRI / f"sftp_sync_{job_name}.py"
+    lp = SFTP_LOGS / f"{job_name}.log"
+    if sp.exists(): sp.unlink()
+    if lp.exists(): lp.unlink()
+
+
+def _sftp_run_task_now(job_name):
+    task_name = f"dfirvault-sftp-{job_name}"
+    subprocess.run(f'schtasks /Run /TN "{task_name}"',
+                   shell=True, capture_output=True)
+
+
+def _sftp_view_log(job_name, lines=60):
+    log_path = SFTP_LOGS / f"{job_name}.log"
+    if not log_path.exists():
+        warn("No log file found yet -- sync may not have run.")
+        return
+    all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
+    print()
+    divider()
+    print(f"  {_c(C.BOLD+C.WHITE, f'Sync log: {job_name}')}  {_c(C.DIM, f'({log_path})')}")
+    divider()
+    for line in recent:
+        if "ERROR" in line or "FAILED" in line:
+            print(f"  {_c(C.RED, line)}")
+        elif "SKIPPED" in line:
+            print(f"  {_c(C.YELLOW, line)}")
+        elif "Stale lock" in line:
+            print(f"  {_c(C.MAGENTA, line)}")
+        elif "DOWNLOADED" in line or "UPLOADED" in line:
+            print(f"  {_c(C.GREEN, line)}")
+        elif "DELETED" in line:
+            print(f"  {_c(C.YELLOW, line)}")
+        elif "START" in line or "END" in line:
+            print(f"  {_c(C.CYAN, line)}")
+        else:
+            print(f"  {_c(C.DIM, line)}")
+    divider()
+    if len(all_lines) > lines:
+        info(f"Showing last {lines} of {len(all_lines)} lines.")
+    print()
+
+
+def _sftp_get_interval_scheduled():
+    subheader("Sync Interval")
+    print(f"  {_c(C.CYAN,'[1]')} Every minute")
+    print(f"  {_c(C.CYAN,'[2]')} Every 5 minutes")
+    print(f"  {_c(C.CYAN,'[3]')} Every 15 minutes")
+    print(f"  {_c(C.CYAN,'[4]')} Hourly")
+    print(f"  {_c(C.CYAN,'[5]')} Daily")
+    while True:
+        ch = prompt("Choice [1-5]:").strip()
+        if ch in ("1","2","3","4","5"):
+            return ch
+        err("Invalid choice.")
 
 
 def menu_sftp():
-    pm, Observer, FSH, tqdm = _sftp_load_heavy()
+    pm, _Obs, _FSH, _tqdm = _sftp_load_heavy()
     if not pm:
         pause(); return
 
-    def make_client(host, user, pw, port, use_sftp):
-        return _FTPClient(host, user, pw, port, use_sftp, pm)
+    jobs = _sftp_jobs_load()
 
     while True:
         header("SFTP / FTP SYNC MONITOR")
         print()
-        print(f"  {_c(C.CYAN,'[1]')} Start new monitor session")
+        print(f"  {_c(C.CYAN,'[1]')} Create new sync job  {_c(C.DIM,'(registers background Task Scheduler task)')}")
+        print(f"  {_c(C.CYAN,'[2]')} View sync status / logs")
+        print(f"  {_c(C.CYAN,'[3]')} Manage existing jobs")
         print(f"  {_c(C.RED, '[0]')} Back")
+        print()
+        print(f"  {_c(C.DIM, C.BULLET + '  Syncs run silently in the background via Task Scheduler.')}")
+        print(f"  {_c(C.DIM, C.BULLET + '  Folder trees are synced recursively (files + subfolders).')}")
         divider()
         ch = prompt("Choice:").strip()
         if ch == "0": break
-        if ch != "1": err("Invalid choice."); continue
 
-        subheader("Connection Setup")
-        use_sftp = not prompt("Use SFTP? (y/n, default y):").strip().lower().startswith("n")
-        host     = prompt("Server host:").strip()
-        default_port = 22 if use_sftp else 21
-        raw_port = prompt(f"Port (default {default_port}):").strip()
-        port     = int(raw_port) if raw_port.isdigit() else default_port
-        username = prompt("Username:").strip()
-        password = _sftp_get_pw_masked("Password: ")
-        interval = _sftp_get_interval()
+        elif ch == "1":
+            subheader("Connection Setup")
+            use_sftp  = not prompt("Use SFTP? (y/n, default y):").strip().lower().startswith("n")
+            host      = prompt("Server host:").strip()
+            if not host: err("Host cannot be empty."); pause(); continue
+            default_port = 22 if use_sftp else 21
+            raw_port  = prompt(f"Port (default {default_port}):").strip()
+            port      = int(raw_port) if raw_port.isdigit() else default_port
+            username  = prompt("Username:").strip()
+            password  = _sftp_get_pw_masked("Password: ")
+            job_label = prompt("Job name (short identifier, e.g. case01-download):").strip()
+            if not job_label:
+                err("Job name cannot be empty."); pause(); continue
+            job_name = re.sub(r"[^a-zA-Z0-9_-]", "_", job_label)
 
-        spinner("Connecting to server…", 1.5)
-        ftp = make_client(host, username, password, port, use_sftp)
-        if not ftp.connect():
-            err("Could not connect. Check credentials and try again.")
-            pause(); continue
+            spinner("Connecting to server...", 1.5)
+            ftp_test = _FTPClient(host, username, password, port, use_sftp, pm)
+            if not ftp_test.connect():
+                err("Could not connect. Check credentials and try again.")
+                pause(); continue
+            info("Select remote folder...")
+            remote_folder = _sftp_select_remote_folder(ftp_test)
+            ftp_test.disconnect()
+            if not remote_folder:
+                err("No remote folder selected."); pause(); continue
+            remote_folder = remote_folder.replace("\\", "/")
 
-        info("Select remote folder…")
-        remote_folder = _sftp_select_remote_folder(ftp)
-        ftp.disconnect()
-        if not remote_folder:
-            err("No remote folder selected."); pause(); continue
-        remote_folder = remote_folder.replace("\\", "/")
+            info("Select local folder...")
+            local_folder = pick_folder("Select Local Folder")
+            if not local_folder:
+                err("No local folder selected."); pause(); continue
 
-        info("Select local folder…")
-        local_folder = pick_folder("Select Local Folder to Monitor")
-        if not local_folder:
-            err("No local folder selected."); pause(); continue
+            print()
+            print(f"  {_c(C.CYAN,'[1]')} REMOTE to LOCAL  {_c(C.DIM,'(download: server to local)')}")
+            print(f"  {_c(C.CYAN,'[2]')} LOCAL to REMOTE  {_c(C.DIM,'(upload: local to server)')}")
+            dir_ch    = prompt("Direction [1/2]:").strip()
+            direction = "local" if dir_ch == "2" else "remote"
+            interval_key = _sftp_get_interval_scheduled()
 
-        print()
-        print(f"  {_c(C.CYAN,'[1]')} REMOTE monitoring  {_c(C.DIM,'(server → local)')}")
-        print(f"  {_c(C.CYAN,'[2]')} LOCAL monitoring   {_c(C.DIM,'(local → server)')}")
-        direction = prompt("Direction [1/2]:").strip()
+            cfg = {
+                "host": host, "username": username, "password": password,
+                "port": port, "use_sftp": use_sftp,
+                "remote_folder": remote_folder, "local_folder": local_folder,
+                "direction": direction,
+            }
 
-        cfg = {"host": host, "username": username, "password": password,
-               "port": port, "use_sftp": use_sftp, "interval": interval,
-               "remote_folder": remote_folder, "local_folder": local_folder}
+            spinner("Generating sync script...", 1.0)
+            script_path = _sftp_make_sync_script(job_name, cfg)
+            spinner("Registering Task Scheduler task...", 1.5)
+            if _sftp_register_task(job_name, script_path, interval_key):
+                imap_desc = {"1":"Every minute","2":"Every 5 min","3":"Every 15 min","4":"Hourly","5":"Daily"}
+                jobs[job_name] = {
+                    "label": job_label,
+                    "host": host, "port": port, "use_sftp": use_sftp,
+                    "remote_folder": remote_folder, "local_folder": local_folder,
+                    "direction": direction,
+                    "interval_desc": imap_desc.get(interval_key, "?"),
+                    "script_path": str(script_path),
+                    "log_path": str(SFTP_LOGS / f"{job_name}.log"),
+                    "created": datetime.now().isoformat(timespec="seconds"),
+                }
+                _sftp_jobs_save(jobs)
+                print()
+                ok(f"Job '{job_name}' created and scheduled.")
+                info(f"Sync log:   {SFTP_LOGS / (job_name + '.log')}")
+                info("Use option [2] from this menu to view sync status.")
+            else:
+                err("Failed to register Task Scheduler task.")
+                err("Ensure DFIRVault is running as Administrator.")
+            pause()
 
-        print()
-        if direction == "2":
-            _sftp_monitor_local(cfg, lambda *a: make_client(*a), Observer, FSH, tqdm)
+        elif ch == "2":
+            jobs = _sftp_jobs_load()
+            if not jobs:
+                warn("No sync jobs configured yet."); pause(); continue
+            subheader("View Sync Status")
+            job_list = list(jobs.keys())
+            print()
+            for i, jn in enumerate(job_list, 1):
+                d = jobs[jn]
+                arrow = "server->local" if d.get("direction") == "remote" else "local->server"
+                itv = d.get("interval_desc", "?"); hst = d.get("host", "?"); lbl = d.get("label", jn)
+                print(f"  {_c(C.CYAN, '['+ str(i) +']')}" + f" {lbl}  " + _c(C.DIM, f"({arrow})  {itv}  |  {hst}"))
+            print(f"  {_c(C.RED, f'[{len(job_list)+1}]')} Back")
+            print()
+            raw = prompt("Select job:").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(job_list):
+                sel_job = job_list[int(raw) - 1]
+                _sftp_view_log(sel_job)
+                print(f"  {_c(C.CYAN,'[1]')} Run sync now   {_c(C.CYAN,'[0]')} Back")
+                if prompt("Action:").strip() == "1":
+                    spinner("Triggering sync task...", 1.5)
+                    _sftp_run_task_now(sel_job)
+                    ok("Sync task triggered. Check log in a moment.")
+            pause()
+
+        elif ch == "3":
+            jobs = _sftp_jobs_load()
+            if not jobs:
+                warn("No sync jobs configured yet."); pause(); continue
+            subheader("Manage Sync Jobs")
+            job_list = list(jobs.keys())
+            print()
+            for i, jn in enumerate(job_list, 1):
+                d = jobs[jn]
+                mode = "Remote->Local" if d.get("direction") == "remote" else "Local->Remote"
+                mode = "Remote->Local" if d.get("direction") == "remote" else "Local->Remote"
+                itv2 = d.get("interval_desc","?"); hst2 = d.get("host","?"); lbl2 = d.get("label",jn)
+                print(f"  {_c(C.CYAN, '['+ str(i) +']')}" + f" {lbl2}  " + _c(C.DIM, f"| {mode} | {itv2} | {hst2}"))
+            print(f"  {_c(C.RED, f'[{len(job_list)+1}]')} Back")
+            print()
+            raw = prompt("Select job:").strip()
+            if not (raw.isdigit() and 1 <= int(raw) <= len(job_list)):
+                continue
+            sel_job = job_list[int(raw) - 1]
+            d = jobs[sel_job]
+            subheader(f"Job: {d.get('label', sel_job)}")
+            arrow = "Server -> Local" if d.get("direction") == "remote" else "Local -> Server"
+            print(f"\n  {_c(C.DIM,'Direction:')}  {arrow}")
+            print(f"  {_c(C.DIM,'Host:     ')}  {d.get('host')}:{d.get('port')}")
+            print(f"  {_c(C.DIM,'Remote:   ')}  {d.get('remote_folder')}")
+            print(f"  {_c(C.DIM,'Local:    ')}  {d.get('local_folder')}")
+            print(f"  {_c(C.DIM,'Interval: ')}  {d.get('interval_desc','?')}")
+            print(f"  {_c(C.DIM,'Log:      ')}  {d.get('log_path','?')}")
+            print(f"  {_c(C.DIM,'Created:  ')}  {d.get('created','?')}")
+            divider()
+            print(f"  {_c(C.CYAN,'[1]')} Run now")
+            print(f"  {_c(C.RED, '[2]')} Delete job + task")
+            print(f"  {_c(C.DIM, '[0]')} Back")
+            sub = prompt("Action:").strip()
+            if sub == "1":
+                spinner("Triggering sync task...", 1.5)
+                _sftp_run_task_now(sel_job)
+                ok("Sync task triggered.")
+            elif sub == "2":
+                if prompt(f"Delete job '{sel_job}'? (y/n):").lower().startswith("y"):
+                    _sftp_delete_task(sel_job)
+                    del jobs[sel_job]
+                    _sftp_jobs_save(jobs)
+                    ok(f"Job '{sel_job}' deleted.")
+            pause()
+
         else:
-            _sftp_monitor_remote(cfg, lambda *a: make_client(*a), tqdm)
-        pause()
+            err("Invalid choice.")
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -5402,6 +5821,480 @@ def menu_bodyfile_explorer():
         else:
             err("Invalid choice.")
 
+
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 11 — CSV SPLITTER
+# ══════════════════════════════════════════════════════════════════
+
+def _csv_get_file_size_mb(filepath):
+    return os.path.getsize(filepath) / (1024 * 1024)
+
+def _csv_count_lines(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return sum(1 for _ in f)
+
+class _CsvCountingWriter:
+    """Wraps a file handle and tracks bytes written."""
+    def __init__(self, file_handle):
+        self.file_handle = file_handle
+        self.byte_count  = 0
+
+    def write(self, data):
+        encoded = data.encode('utf-8')
+        self.byte_count += len(encoded)
+        self.file_handle.write(data)
+
+    def flush(self):   self.file_handle.flush()
+    def close(self):   self.file_handle.close()
+    def size_mb(self): return self.byte_count / (1024 * 1024)
+
+
+def _csv_split_by_lines(input_file, output_prefix, lines_per_file, dup_header):
+    total_data_lines = _csv_count_lines(input_file) - (1 if dup_header else 0)
+    split_files = []
+    start = time.time()
+
+    with open(input_file, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        header = next(reader) if dup_header else None
+
+        file_count   = 1
+        current_line = 0
+        out_fh = None
+        writer = None
+
+        for row in reader:
+            if current_line % lines_per_file == 0:
+                if out_fh:
+                    out_fh.close()
+                out_path = f"{output_prefix}_{file_count}.csv"
+                out_fh = open(out_path, 'w', newline='', encoding='utf-8')
+                split_files.append(out_path)
+                writer = csv.writer(out_fh)
+                if dup_header and header:
+                    writer.writerow(header)
+                file_count += 1
+
+            writer.writerow(row)
+            current_line += 1
+
+            if current_line % 5000 == 0 or current_line == total_data_lines:
+                progress_bar(current_line, total_data_lines, label=f"line {current_line:,}")
+
+        if out_fh:
+            out_fh.close()
+
+    print()
+    elapsed = time.time() - start
+    ok(f"Created {file_count - 1} file(s) in {elapsed:.2f}s")
+    return split_files
+
+
+def _csv_split_by_size(input_file, output_prefix, max_size_mb, dup_header):
+    total_size = _csv_get_file_size_mb(input_file)
+    split_files  = []
+    start = time.time()
+    processed_mb = 0.0
+
+    with open(input_file, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        header = next(reader) if dup_header else None
+
+        file_count = 1
+
+        def _open_next():
+            nonlocal file_count
+            out_path = f"{output_prefix}_{file_count}.csv"
+            fh = open(out_path, 'w', newline='', encoding='utf-8')
+            cw = _CsvCountingWriter(fh)
+            w  = csv.writer(cw)
+            if header:
+                w.writerow(header)
+            file_count += 1
+            split_files.append(out_path)
+            return cw, w
+
+        cw, writer = _open_next()
+
+        for row in reader:
+            tmp = StringIO()
+            csv.writer(tmp).writerow(row)
+            row_mb = len(tmp.getvalue().encode('utf-8')) / (1024 * 1024)
+
+            if cw.size_mb() + row_mb > max_size_mb:
+                cw.close()
+                cw, writer = _open_next()
+
+            writer.writerow(row)
+            processed_mb += row_mb
+            progress_bar(min(processed_mb, total_size), total_size,
+                         label=f"{processed_mb:.1f} / {total_size:.1f} MB")
+
+        cw.close()
+
+    print()
+    elapsed = time.time() - start
+    ok(f"Created {file_count - 1} file(s) in {elapsed:.2f}s")
+    return split_files
+
+
+def _csv_verify_integrity(original_file, split_files, dup_header):
+    subheader("Integrity Check")
+    original_lines = _csv_count_lines(original_file) - 1  # exclude header
+
+    split_total = 0
+    for fp in split_files:
+        with open(fp, 'r', encoding='utf-8') as fh:
+            n = sum(1 for _ in fh)
+            if dup_header:
+                n -= 1
+            split_total += n
+
+    print(f"  {_c(C.DIM, 'Original lines (excl. header):')} {original_lines:,}")
+    print(f"  {_c(C.DIM, 'Lines across split files:     ')} {split_total:,}")
+
+    if split_total == original_lines:
+        ok("Line integrity check passed — all lines accounted for.")
+    else:
+        err(f"Integrity check FAILED  (difference: {original_lines - split_total:+,} lines)")
+
+
+def menu_csv_splitter():
+    header("CSV SPLITTER")
+    info("Split large CSV files by size (MB) or number of lines")
+    print()
+
+    while True:
+        print(f"  {_c(C.CYAN, '[1]')} Split a CSV file")
+        print(f"  {_c(C.RED,  '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+
+        if ch == "0":
+            break
+        elif ch != "1":
+            err("Invalid choice.")
+            continue
+
+        # ── file selection ──────────────────────────────────────
+        clear_screen()
+        header("CSV SPLITTER")
+        info("Select input CSV file…")
+        input_file = pick_file("Select CSV to split",
+                               filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not input_file:
+            warn("No file selected.")
+            pause(); continue
+
+        size_mb     = _csv_get_file_size_mb(input_file)
+        total_lines = _csv_count_lines(input_file) - 1
+        print()
+        ok(f"Loaded: {os.path.basename(input_file)}")
+        print(f"  {_c(C.DIM, 'Size:')}  {size_mb:.2f} MB")
+        print(f"  {_c(C.DIM, 'Data rows:')} {total_lines:,}")
+        print()
+
+        # ── split method ────────────────────────────────────────
+        print(f"  {_c(C.CYAN, '[1]')} Split by file size (MB)")
+        print(f"  {_c(C.CYAN, '[2]')} Split by number of lines")
+        divider()
+        method = prompt("Split method:").strip()
+
+        if method == "1":
+            raw = prompt("Max size per split file in MB (e.g. 500):").strip()
+            try:
+                max_size = float(raw)
+            except ValueError:
+                err("Invalid value."); pause(); continue
+            split_type = "size"
+        elif method == "2":
+            raw = prompt("Max lines per split file (e.g. 100000):").strip()
+            try:
+                max_lines = int(raw)
+            except ValueError:
+                err("Invalid value."); pause(); continue
+            split_type = "lines"
+        else:
+            err("Invalid selection."); pause(); continue
+
+        dup_hdr_raw = prompt("Duplicate header in each split file? (y/n):").strip().lower()
+        dup_header  = dup_hdr_raw == "y"
+
+        # ── output directory ────────────────────────────────────
+        info("Select output directory…")
+        output_dir = pick_folder("Select Output Directory")
+        if not output_dir:
+            warn("No output directory selected."); pause(); continue
+
+        base     = os.path.splitext(os.path.basename(input_file))[0]
+        out_pfx  = os.path.join(output_dir, base + "_split")
+
+        print()
+        info(f"Splitting  →  {os.path.normpath(out_pfx)}_#.csv")
+        print()
+
+        try:
+            if split_type == "size":
+                split_files = _csv_split_by_size(input_file, out_pfx, max_size, dup_header)
+            else:
+                split_files = _csv_split_by_lines(input_file, out_pfx, max_lines, dup_header)
+
+            print()
+            _csv_verify_integrity(input_file, split_files, dup_header)
+
+            print()
+            info("Opening output folder…")
+            try:
+                os.startfile(output_dir)
+            except Exception:
+                pass
+
+        except Exception as exc:
+            err(f"Split failed: {exc}")
+
+        pause()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 12 — CSV TIMESTAMP CLEANER
+# ══════════════════════════════════════════════════════════════════
+
+def _ts_guess_column(columns):
+    """Return the most likely timestamp column name."""
+    priority = ['timestamp', '@timestamp', 'time', 'datetime', 'date']
+    for p in priority:
+        for col in columns:
+            if re.search(p, col, re.IGNORECASE):
+                return col
+    return None
+
+
+def _ts_format_sample(val):
+    """Try to convert a raw value to a human-readable date string for preview."""
+    try:
+        num = float(str(val))
+        digits = len(str(int(num)))
+        if digits >= 13:
+            return datetime.utcfromtimestamp(num / 1000).strftime("%d/%m/%Y %H:%M:%S") + "  (epoch ms)"
+        elif digits == 10:
+            return datetime.utcfromtimestamp(num).strftime("%d/%m/%Y %H:%M:%S") + "  (epoch s)"
+    except Exception:
+        pass
+    return str(val)
+
+
+def _ts_convert_value(val):
+    """Convert a single timestamp value → 'DD/MM/YYYY HH:MM:SS' string or None."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        if re.match(r'^\d+(\.\d+)?$', s):
+            f = float(s)
+            if f > 1e12:
+                return datetime.utcfromtimestamp(f / 1000).strftime("%d/%m/%Y %H:%M:%S")
+            else:
+                return datetime.utcfromtimestamp(f).strftime("%d/%m/%Y %H:%M:%S")
+        else:
+            import pandas as _pd_local
+            dt = _pd_local.to_datetime(val, utc=True)
+            return dt.strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _ts_select_column_interactive(df):
+    """Present column list, let user pick the timestamp column."""
+    print()
+    subheader("Column Selection")
+    sample_row = df.iloc[0].to_dict() if not df.empty else {}
+
+    for i, col in enumerate(df.columns, 1):
+        sample = str(sample_row.get(col, ''))[:60]
+        print(f"  {_c(C.CYAN, f'[{i:>2}]')} {col}  {_c(C.DIM, sample)}")
+
+    print()
+    default_guess = _ts_guess_column(df.columns)
+    if default_guess:
+        eg = str(sample_row.get(default_guess, ''))[:40]
+        info(f"Suggested: {_c(C.YELLOW, default_guess)}  ({eg})")
+    print()
+
+    while True:
+        raw = prompt(f"Select timestamp column [Enter = '{default_guess}']:").strip()
+        if raw == "" and default_guess:
+            col_name = default_guess
+            break
+        try:
+            idx = int(raw) - 1
+            col_name = df.columns[idx]
+            break
+        except (ValueError, IndexError):
+            err("Invalid selection, try again.")
+
+    # Preview samples
+    print()
+    subheader(f"Sample values → '{col_name}'")
+    for s in df[col_name].dropna().astype(str).head(5).tolist():
+        formatted = _ts_format_sample(s)
+        print(f"  {_c(C.DIM, s[:40])}  →  {_c(C.GREEN, formatted)}")
+
+    print()
+    confirm = prompt("Proceed with this column? (y/n):").strip().lower()
+    if confirm != "y":
+        return _ts_select_column_interactive(df)
+
+    return col_name
+
+
+def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False):
+    """Read CSV, convert timestamps, save output.  Returns (lines_read, lines_written, out_path)."""
+    if not _PANDAS_OK:
+        err("pandas is required for this feature.  Install with:  pip install pandas")
+        return 0, 0, None
+
+    import pandas as _pd_local
+
+    df = _pd_local.read_csv(csv_path, encoding='utf-8', low_memory=False, on_bad_lines='warn')
+    df = df.where(_pd_local.notnull(df), None)
+    lines_read = len(df)
+
+    if auto:
+        col = _ts_guess_column(df.columns)
+        if not col:
+            warn(f"Could not auto-detect timestamp column in: {os.path.basename(csv_path)}")
+            return lines_read, 0, None
+    else:
+        col = ts_col if ts_col else _ts_select_column_interactive(df)
+        if not col:
+            return lines_read, 0, None
+
+    info(f"Converting  '{col}'  →  timestamp …")
+    total = len(df)
+    converted = []
+    for i, val in enumerate(df[col]):
+        converted.append(_ts_convert_value(val))
+        if (i + 1) % 5000 == 0 or (i + 1) == total:
+            progress_bar(i + 1, total, label=f"{i+1:,} / {total:,}")
+    print()
+
+    df['timestamp'] = converted
+    cols = ['timestamp'] + [c for c in df.columns if c != 'timestamp']
+    df = df[cols]
+
+    base     = os.path.splitext(os.path.basename(csv_path))[0]
+    out_name = base + "_processed.csv"
+    out_path = os.path.join(output_folder, out_name)
+    df.to_csv(out_path, index=False)
+    lines_written = len(df)
+    return lines_read, lines_written, out_path
+
+
+def menu_csv_timestamp_cleaner():
+    header("CSV TIMESTAMP CLEANER")
+    info("Normalise timestamps to DD/MM/YYYY HH:MM:SS — supports epoch (s/ms) and ISO-8601")
+    print()
+
+    while True:
+        print(f"  {_c(C.CYAN, '[1]')} Process single CSV file  {_c(C.DIM, 'interactive column selection')}")
+        print(f"  {_c(C.CYAN, '[2]')} Bulk process folder       {_c(C.DIM, 'auto-detect timestamp column')}")
+        print(f"  {_c(C.RED,  '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+
+        if ch == "0":
+            break
+
+        elif ch == "1":
+            clear_screen()
+            header("CSV TIMESTAMP CLEANER  —  SINGLE FILE")
+
+            info("Select input CSV file…")
+            csv_path = pick_file("Select CSV file",
+                                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if not csv_path:
+                warn("No file selected."); pause(); continue
+
+            ok(f"Loaded: {os.path.basename(csv_path)}")
+
+            info("Select output folder…")
+            out_folder = pick_folder("Select Output Folder")
+            if not out_folder:
+                warn("No output folder selected."); pause(); continue
+
+            print()
+            try:
+                lines_r, lines_w, out_path = _ts_process_file(csv_path, out_folder)
+            except Exception as exc:
+                err(f"Processing failed: {exc}"); pause(); continue
+
+            if out_path:
+                print()
+                subheader("Summary")
+                print(f"  {_c(C.DIM, 'Input file: ')} {os.path.basename(csv_path)}")
+                print(f"  {_c(C.DIM, 'Lines read: ')} {lines_r:,}")
+                print(f"  {_c(C.DIM, 'Lines out:  ')} {lines_w:,}")
+                print(f"  {_c(C.DIM, 'Saved to:   ')} {out_path}")
+                ok("Processing complete.")
+            pause()
+
+        elif ch == "2":
+            clear_screen()
+            header("CSV TIMESTAMP CLEANER  —  BULK")
+
+            info("Select folder containing CSV files (searches subfolders)…")
+            in_folder = pick_folder("Select Input Folder")
+            if not in_folder:
+                warn("No folder selected."); pause(); continue
+
+            info("Select output folder…")
+            out_folder = pick_folder("Select Output Folder")
+            if not out_folder:
+                warn("No output folder selected."); pause(); continue
+
+            csv_files = []
+            for root_dir, _, files in os.walk(in_folder):
+                for fn in files:
+                    if fn.lower().endswith('.csv'):
+                        csv_files.append(os.path.join(root_dir, fn))
+
+            if not csv_files:
+                warn("No CSV files found in selected folder."); pause(); continue
+
+            info(f"Found {len(csv_files)} CSV file(s). Processing with auto-detection…")
+            print()
+
+            success, total_r, total_w = 0, 0, 0
+            for i, fp in enumerate(csv_files, 1):
+                info(f"[{i}/{len(csv_files)}] {os.path.basename(fp)}")
+                try:
+                    lr, lw, out_path = _ts_process_file(fp, out_folder, auto=True)
+                    total_r += lr
+                    if out_path:
+                        total_w += lw
+                        success += 1
+                        ok(f"Saved → {os.path.basename(out_path)}")
+                    else:
+                        warn(f"Skipped (no timestamp column detected)")
+                except Exception as exc:
+                    err(f"Failed: {exc}")
+
+            print()
+            subheader("Bulk Summary")
+            print(f"  {_c(C.DIM, 'Files found:       ')} {len(csv_files)}")
+            print(f"  {_c(C.DIM, 'Successfully saved:')} {success}")
+            print(f"  {_c(C.DIM, 'Failed / skipped:  ')} {len(csv_files) - success}")
+            print(f"  {_c(C.DIM, 'Total rows read:   ')} {total_r:,}")
+            print(f"  {_c(C.DIM, 'Total rows written:')} {total_w:,}")
+            ok("Bulk processing complete.")
+            pause()
+
+        else:
+            err("Invalid choice.")
+
+
 BANNER = f"""
 {_c(C.CYAN, '━' * 62)}
 {_c(C.BOLD + C.CYAN, '  ██████╗ ███████╗██╗██████╗ ██╗  ██╗ █████╗ ██╗     ██╗██╗  ████████╗')}
@@ -5448,6 +6341,10 @@ def main():
         print(f"  {_c(C.BOLD+C.WHITE, '─── FORENSIC TIMELINE ──────────────────────')}")
         print(f"  {_c(C.CYAN,'[10]')} Bodyfile Explorer  {_c(C.DIM,'bodyfile → CSV + interactive forensic analysis')}")
         print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── CSV UTILITIES ──────────────────────────')}")
+        print(f"  {_c(C.CYAN,'[11]')} CSV Splitter        {_c(C.DIM,'split large CSVs by size or line count')}")
+        print(f"  {_c(C.CYAN,'[12]')} CSV Timestamp Cleaner  {_c(C.DIM,'normalise timestamps to DD/MM/YYYY HH:MM:SS')}")
+        print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         divider()
         choice = prompt("Select section:").strip()
@@ -5461,10 +6358,12 @@ def main():
         elif choice == "8": clear_screen(); menu_vault_mirror()
         elif choice == "9": clear_screen(); menu_log_enricher()
         elif choice == "10": clear_screen(); menu_bodyfile_explorer()
+        elif choice == "11": clear_screen(); menu_csv_splitter()
+        elif choice == "12": clear_screen(); menu_csv_timestamp_cleaner()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-10 or 0.")
+            err("Invalid choice. Enter 1-12 or 0.")
         clear_screen()
         print(BANNER)
 
