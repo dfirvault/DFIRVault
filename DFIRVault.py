@@ -35,6 +35,7 @@ import logging
 import zipfile
 import ctypes
 import platform
+import sqlite3
 import threading
 import subprocess
 import webbrowser
@@ -2938,7 +2939,7 @@ class _LE_OTXEnricher:
         if key in self.cache:
             return self.cache[key]
         empty = {'otx_threat_score':0,'otx_pulse_count':0,'otx_malicious_pulses':0,
-                 'otx_pulse_names':'','otx_tags':'','otx_malicious':False,'otx_found':False}
+                 'otx_pulse_names':'','otx_pulse_urls':'','otx_tags':'','otx_malicious':False,'otx_found':False}
         try:
             url = f"{self.base_url}/indicators/{indicator_type}/{indicator}/general"
             r   = _le_requests.get(url, headers=self.headers, timeout=30)
@@ -2946,10 +2947,12 @@ class _LE_OTXEnricher:
                 data   = r.json()
                 pulses = data.get('pulse_info',{}).get('pulses',[])
                 count  = data.get('pulse_info',{}).get('count',0)
-                names, tags, mal = [], set(), 0
+                names, urls, tags, mal = [], [], set(), 0
                 for p in pulses[:10]:
                     n = p.get('name','')
                     if n: names.append(n[:100])
+                    pid = p.get('id','')
+                    if pid: urls.append(f"https://otx.alienvault.com/pulse/{pid}")
                     tags.update(p.get('tags',[]))
                     if p.get('is_malicious'): mal += 1
                 result = {
@@ -2957,6 +2960,7 @@ class _LE_OTXEnricher:
                     'otx_pulse_count':      count,
                     'otx_malicious_pulses': mal,
                     'otx_pulse_names':      ' | '.join(names[:5]),
+                    'otx_pulse_urls':       ' | '.join(urls[:5]),
                     'otx_tags':             ', '.join(list(tags)[:15]),
                     'otx_malicious':        mal > 0,
                     'otx_found':            True,
@@ -3623,7 +3627,7 @@ def menu_log_enricher():
 # Merged from bodyfile_to_csv_with_report_lightweight_enhanced.py
 # Original: Jacob Wilson  •  dfirvault@gmail.com
 
-def __PLACEHOLDER_bf_bf_convert_epoch_to_str(epoch):
+def bf_convert_epoch_to_str(epoch):
     """Convert epoch to dd/mm/yyyy HH:MM:SS (UTC), or blank if 0/invalid."""
     try:
         epoch = int(epoch)
@@ -3633,7 +3637,7 @@ def __PLACEHOLDER_bf_bf_convert_epoch_to_str(epoch):
         pass
     return ""
 
-def __PLACEHOLDER_bf_bf_assess_noteworthy(name, mode, atime, mtime, ctime, crtime):
+def bf_assess_noteworthy(name, mode, atime, mtime, ctime, crtime):
     """
     Return comma-separated noteworthy flags based on heuristics.
     Also return file type category.
@@ -3726,7 +3730,7 @@ def __PLACEHOLDER_bf_bf_assess_noteworthy(name, mode, atime, mtime, ctime, crtim
 
     return ", ".join(flags) if flags else "", file_type
 
-def __PLACEHOLDER_bf_bf_get_available_port(start_port=8000, max_port=8100):
+def bf_get_available_port(start_port=8000, max_port=8100):
     """Find an available port starting from start_port up to max_port"""
     for port in range(start_port, max_port + 1):
         try:
@@ -3737,7 +3741,7 @@ def __PLACEHOLDER_bf_bf_get_available_port(start_port=8000, max_port=8100):
             continue
     raise Exception(f"No available ports found between {start_port} and {max_port}")
 
-def __PLACEHOLDER_bf_bf_ask_date_range_filter():
+def bf_ask_date_range_filter():
     """Ask user if they want to apply date range filtering"""
     root = tk.Tk()
     root.title("Date Range Filter")
@@ -3909,7 +3913,7 @@ def __PLACEHOLDER_bf_bf_ask_date_range_filter():
     root.mainloop()
     return result
 
-def __PLACEHOLDER_bf_bf_filter_rows_by_date_range(rows, date_filter):
+def bf_filter_rows_by_date_range(rows, date_filter):
     """Filter rows based on date range criteria"""
     if not date_filter["apply_filter"]:
         return rows
@@ -3952,7 +3956,7 @@ def __PLACEHOLDER_bf_bf_filter_rows_by_date_range(rows, date_filter):
 # Database Storage for Fast Access
 # -------------------------------------------------------------------
 
-def __PLACEHOLDER_bf_bf_create_database(rows, db_path, bodyfile_name="default"):
+def bf_create_database(rows, db_path, bodyfile_name="default"):
     """Create SQLite database for fast querying with multiple bodyfile support"""
     conn = sqlite3.connect(db_path)
     
@@ -4025,7 +4029,7 @@ def __PLACEHOLDER_bf_bf_create_database(rows, db_path, bodyfile_name="default"):
     conn.close()
     print(f"📊 Database updated with {len(rows):,} records from {bodyfile_name}")
 
-def __PLACEHOLDER_bf_bf_add_bodyfile_to_database(bodyfile_path, db_path):
+def bf_add_bodyfile_to_database(bodyfile_path, db_path):
     """Add a new bodyfile to existing database"""
     rows = []
     processed = 0
@@ -4102,7 +4106,7 @@ def __PLACEHOLDER_bf_bf_add_bodyfile_to_database(bodyfile_path, db_path):
     print(f"📊 Database updated with {len(rows):,} additional records from {bodyfile_name}")
     return len(rows)
 
-def __PLACEHOLDER_bf_bf_verify_database_contents(db_path):
+def bf_verify_database_contents(db_path):
     """Verify the database has the expected data"""
     try:
         conn = sqlite3.connect(db_path)
@@ -4130,7 +4134,7 @@ def __PLACEHOLDER_bf_bf_verify_database_contents(db_path):
         print(f"❌ Database verification failed: {e}")
         return False
 
-def __PLACEHOLDER_bf_bf_check_database_schema(db_path):
+def bf_check_database_schema(db_path):
     """Check the database schema and contents"""
     try:
         conn = sqlite3.connect(db_path)
@@ -4160,7 +4164,7 @@ def __PLACEHOLDER_bf_bf_check_database_schema(db_path):
     except Exception as e:
         print(f"❌ Database schema check failed: {e}")
 
-def __PLACEHOLDER_bf_bf_test_database_query(db_path):
+def bf_test_database_query(db_path):
     """Test a simple database query"""
     try:
         conn = sqlite3.connect(db_path)
@@ -4182,7 +4186,7 @@ def __PLACEHOLDER_bf_bf_test_database_query(db_path):
         print(f"❌ Database test failed: {e}")
         return False
 
-def __PLACEHOLDER_bf_bf_get_summary_stats(db_path, timeline_type="mtime"):
+def bf_get_summary_stats(db_path, timeline_type="mtime"):
     """Get summary statistics from database with configurable timeline type"""
     conn = sqlite3.connect(db_path)
     
@@ -4308,7 +4312,7 @@ def __PLACEHOLDER_bf_bf_get_summary_stats(db_path, timeline_type="mtime"):
 # Lightweight HTML Generation
 # -------------------------------------------------------------------
 
-def __PLACEHOLDER_bf_bf_generate_lightweight_html(db_path, csv_path, port):
+def bf_generate_lightweight_html(db_path, csv_path, port):
     """Generate a small HTML file that uses AJAX to load data"""
     out_dir = os.path.dirname(os.path.abspath(csv_path)) or "."
     base = os.path.splitext(os.path.basename(csv_path))[0]
@@ -5034,7 +5038,7 @@ def __PLACEHOLDER_bf_bf_generate_lightweight_html(db_path, csv_path, port):
 # Enhanced Web Server for Data API
 # -------------------------------------------------------------------
 
-class BfBfForensicRequestHandler(SimpleHTTPRequestHandler):
+class BfForensicRequestHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.db_path = kwargs.pop('db_path')
         super().__init__(*args, **kwargs)
@@ -5470,7 +5474,7 @@ class BfBfForensicRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(response).encode())
 
-def __PLACEHOLDER_bf_bf_start_server(db_path, port=8000):
+def bf_start_server(db_path, port=8000):
     """Start the local web server with bodyfile addition support"""
     handler = lambda *args: BfForensicRequestHandler(*args, db_path=db_path)
     
@@ -5681,7 +5685,7 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
     print(f"🌐 Opening browser on port {port}...")
     
     # Start server in background thread
-    server_thread = threading.Thread(target=start_server, args=(db_path, port), daemon=True)
+    server_thread = threading.Thread(target=bf_start_server, args=(db_path, port), daemon=True)
     server_thread.start()
     
     # Wait a moment for server to start, then open browser
