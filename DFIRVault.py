@@ -16,6 +16,7 @@ Sections:
   10. Body file to CSV       — convert a body file to CSV
   11. CSV Splitter           — split large CSV files by size or line count
   12. CSV Timestamp Cleaner  — normalise timestamps to DD/MM/YYYY HH:MM:SS
+  13. Qemu menu              — convert forensic image formats
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -6313,6 +6314,387 @@ BANNER = f"""
 """
 
 
+# ══════════════════════════════════════════════════════════════════
+# DISK IMAGE CONVERTER (qemu-img wrapper)
+# ══════════════════════════════════════════════════════════════════
+
+_QIMG_FORMAT_EXTENSIONS = {
+    "raw":       [".raw", ".img", ".bin"],
+    "qcow2":     [".qcow2"],
+    "qcow":      [".qcow"],
+    "qed":       [".qed"],
+    "vdi":       [".vdi"],
+    "vmdk":      [".vmdk"],
+    "vhdx":      [".vhdx"],
+    "vpc":       [".vhd"],
+    "bochs":     [".bochs", ".img"],
+    "cow":       [".cow"],
+    "parallels": [".hds"],
+    "dmg":       [".dmg"],
+}
+_QIMG_SUPPORTED_FORMATS = list(_QIMG_FORMAT_EXTENSIONS.keys())
+
+
+def _qimg_read_header(path, n=512):
+    try:
+        with open(path, "rb") as f:
+            return f.read(n)
+    except OSError:
+        return b""
+
+
+def _qimg_detect_format(path):
+    """Best-effort detection of a disk image's format via header/footer magic bytes."""
+    header = _qimg_read_header(path)
+    if not header:
+        return "unknown"
+
+    if header[0:4] == b"QFI\xfb":
+        version = int.from_bytes(header[4:8], "big")
+        if version == 1:
+            return "qcow"
+        elif version >= 2:
+            return "qcow2"
+        return "qcow"
+
+    if header[0:4] == b"QED\x00":
+        return "qed"
+
+    if b"VirtualBox Disk Image" in header[0:64] or header[64:68] in (b"\x7f\x10\xda\xbe", b"\xbe\xda\x10\x7f"):
+        return "vdi"
+
+    if header[0:4] == b"KDMV":
+        return "vmdk"
+    if header.lstrip().startswith(b"# Disk DescriptorFile"):
+        return "vmdk"
+
+    if header[0:8] == b"vhdxfile":
+        return "vhdx"
+
+    if header[0:8] == b"conectix":
+        return "vpc"
+    try:
+        size = os.path.getsize(path)
+        if size >= 512:
+            with open(path, "rb") as f:
+                f.seek(size - 512)
+                footer = f.read(512)
+            if footer[0:8] == b"conectix":
+                return "vpc"
+    except OSError:
+        pass
+
+    if b"Bochs Virtual HD Image" in header[0:32]:
+        return "bochs"
+
+    if header[0:16] in (b"WithoutFreeSpace", b"WithouFreSpacExt"):
+        return "parallels"
+
+    try:
+        size = os.path.getsize(path)
+        if size >= 512:
+            with open(path, "rb") as f:
+                f.seek(size - 512)
+                trailer = f.read(512)
+            if trailer[0:4] == b"koly":
+                return "dmg"
+    except OSError:
+        pass
+
+    if header[0:4] == b"COWD":
+        return "cow"
+
+    return "raw"
+
+
+def _qimg_likely_formats_for_extension(path):
+    ext = os.path.splitext(path)[1].lower()
+    return [fmt for fmt, exts in _QIMG_FORMAT_EXTENSIONS.items() if ext in exts]
+
+
+def _qimg_resolve_binary():
+    """
+    Resolve the path to qemu-img.exe using the registry
+    (HKCU\\Software\\DFIRVault\\Qemu\\QemuImgPath). If missing/invalid,
+    prompt the user to locate it (and save it back to the registry), or
+    open the download page if cancelled.
+    """
+    saved_path = RegistryConfig.load_config("Qemu", "QemuImgPath")
+
+    if saved_path and os.path.isfile(saved_path):
+        return saved_path
+
+    if saved_path and not os.path.isfile(saved_path):
+        warn(f"Registry points to a missing file: {saved_path}")
+    else:
+        info(r"No qemu-img location found in registry (HKCU\Software\DFIRVault\Qemu).")
+
+    while True:
+        if _LE_IMPORTS_OK:
+            pass  # no-op, just keeping flake-friendly
+        root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+        messagebox.showinfo(
+            "qemu-img location required",
+            "qemu-img.exe could not be located.\n\n"
+            "Please select the qemu-img.exe file (usually inside your "
+            "QEMU installation directory, e.g. C:\\Program Files\\qemu)."
+        )
+        chosen = filedialog.askopenfilename(
+            title="Select qemu-img.exe",
+            filetypes=[("qemu-img executable", "qemu-img.exe"), ("All files", "*.*")],
+        )
+        root.destroy()
+
+        if not chosen:
+            url = "https://cloudbase.it/qemu-img-windows/"
+            msg = (
+                "qemu-img.exe is required for the Disk Image Converter.\n\n"
+                f"Opening download page:\n{url}\n\n"
+                "Download and unzip the latest qemu-img-windows release, "
+                "then return to this menu and try again, selecting "
+                "qemu-img.exe from the unzipped folder."
+            )
+            root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+            messagebox.showinfo("Download qemu-img for Windows", msg)
+            root.destroy()
+            webbrowser.open(url)
+            return None
+
+        if not os.path.isfile(chosen):
+            err(f"File not found: {chosen}")
+            continue
+
+        if os.path.basename(chosen).lower() != "qemu-img.exe":
+            if not yesno_dialog(
+                "Confirm executable",
+                f"Selected file is '{os.path.basename(chosen)}', not "
+                "'qemu-img.exe'. Use it anyway?"
+            ):
+                continue
+
+        RegistryConfig.save_config("Qemu", "QemuImgPath", chosen)
+        ok(f"Saved qemu-img path to registry: {chosen}")
+        return chosen
+
+
+def _qimg_pick_output_path(default_name, dst_format):
+    ext = _QIMG_FORMAT_EXTENSIONS.get(dst_format, [".img"])[0]
+    suggested = os.path.splitext(default_name)[0] + ext
+
+    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+    filepath = filedialog.asksaveasfilename(
+        title="Save converted image as",
+        initialfile=suggested,
+        defaultextension=ext,
+    )
+    root.destroy()
+    return filepath or None
+
+
+def _qimg_build_job():
+    """Collect one conversion job from the user via console + dialogs. Returns dict or None."""
+    subheader("New Conversion Job")
+
+    print("  Select the DESTINATION format:")
+    for i, fmt in enumerate(_QIMG_SUPPORTED_FORMATS, 1):
+        print(f"    [{i}] {fmt}")
+    while True:
+        choice = prompt(f"Enter a number (1-{len(_QIMG_SUPPORTED_FORMATS)}):").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(_QIMG_SUPPORTED_FORMATS):
+            dst_format = _QIMG_SUPPORTED_FORMATS[int(choice) - 1]
+            break
+        err("Invalid selection, try again.")
+
+    info("Select the disk image file to convert...")
+    src_path = pick_file(title="Select source disk image")
+    if not src_path:
+        warn("No source file selected, cancelling this job.")
+        return None
+    if not os.path.isfile(src_path):
+        err(f"File not found: {src_path}")
+        return None
+
+    detected_fmt = _qimg_detect_format(src_path)
+    ext_matches = _qimg_likely_formats_for_extension(src_path)
+    ext = os.path.splitext(src_path)[1].lower() or "(none)"
+
+    print(f"\n  Source file: {src_path}")
+    print(f"  File extension: {ext}")
+    print(f"  Detected format (from file header): {detected_fmt}")
+    print(f"  Format(s) typically associated with this extension: "
+          f"{', '.join(ext_matches) if ext_matches else 'none recognized'}")
+
+    if detected_fmt != "unknown" and detected_fmt in ext_matches:
+        src_format = detected_fmt
+        ok(f"Extension and header agree. Using source format: {src_format}")
+    elif detected_fmt == "raw" and not ext_matches:
+        warn("No structured header detected and extension is unrecognized.")
+        print("  Select the SOURCE format to use:")
+        for i, fmt in enumerate(_QIMG_SUPPORTED_FORMATS, 1):
+            print(f"    [{i}] {fmt}")
+        while True:
+            choice = prompt(f"Enter a number (1-{len(_QIMG_SUPPORTED_FORMATS)}):").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(_QIMG_SUPPORTED_FORMATS):
+                src_format = _QIMG_SUPPORTED_FORMATS[int(choice) - 1]
+                break
+            err("Invalid selection, try again.")
+    else:
+        warn("Format mismatch or uncertain detection!")
+        if detected_fmt != "unknown":
+            print(f"    Header suggests   : {detected_fmt}")
+        else:
+            print("    Header format could not be determined.")
+        if ext_matches:
+            print(f"    Extension suggests: {', '.join(ext_matches)}")
+        else:
+            print("    Extension does not correspond to a known format.")
+
+        use_detected = False
+        if detected_fmt != "unknown":
+            use_detected = yesno_dialog(
+                "Source format",
+                f"Use the header-detected format '{detected_fmt}' as the source format?"
+            )
+
+        if use_detected:
+            src_format = detected_fmt
+        elif ext_matches:
+            if len(ext_matches) == 1:
+                use_ext = yesno_dialog(
+                    "Source format",
+                    f"Use the extension-derived format '{ext_matches[0]}' instead?"
+                )
+                if use_ext:
+                    src_format = ext_matches[0]
+                else:
+                    src_format = None
+            else:
+                src_format = None
+            if src_format is None:
+                options = ext_matches if len(ext_matches) > 1 else _QIMG_SUPPORTED_FORMATS
+                print("  Select the SOURCE format to use:")
+                for i, fmt in enumerate(options, 1):
+                    print(f"    [{i}] {fmt}")
+                while True:
+                    choice = prompt(f"Enter a number (1-{len(options)}):").strip()
+                    if choice.isdigit() and 1 <= int(choice) <= len(options):
+                        src_format = options[int(choice) - 1]
+                        break
+                    err("Invalid selection, try again.")
+        else:
+            print("  Select the SOURCE format to use:")
+            for i, fmt in enumerate(_QIMG_SUPPORTED_FORMATS, 1):
+                print(f"    [{i}] {fmt}")
+            while True:
+                choice = prompt(f"Enter a number (1-{len(_QIMG_SUPPORTED_FORMATS)}):").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(_QIMG_SUPPORTED_FORMATS):
+                    src_format = _QIMG_SUPPORTED_FORMATS[int(choice) - 1]
+                    break
+                err("Invalid selection, try again.")
+
+    print(f"\n  Using source format: {src_format}")
+    print(f"  Target output format: {dst_format}")
+
+    info("Select where to save the converted file...")
+    out_path = _qimg_pick_output_path(os.path.basename(src_path), dst_format)
+    if not out_path:
+        warn("No output path selected, cancelling this job.")
+        return None
+
+    if os.path.abspath(out_path) == os.path.abspath(src_path):
+        err("Output path is the same as the source file -- cancelling this job "
+            "to avoid overwriting the source.")
+        return None
+
+    return {
+        "src_path": src_path,
+        "src_format": src_format,
+        "dst_format": dst_format,
+        "out_path": out_path,
+    }
+
+
+def _qimg_run_job(job, qemu_img_bin):
+    src = job["src_path"]
+    dst = job["out_path"]
+    src_fmt = job["src_format"]
+    dst_fmt = job["dst_format"]
+
+    out_dir = os.path.dirname(os.path.abspath(dst))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    cmd = [qemu_img_bin, "convert", "-f", src_fmt, "-O", dst_fmt, src, dst]
+    info("Running: " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        err(f"'{qemu_img_bin}' not found. Is qemu-img installed?")
+        return False
+
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        err(f"Conversion failed ({result.returncode}):")
+        print(result.stderr.strip())
+        return False
+
+    if result.stderr.strip():
+        print(result.stderr.strip())
+    ok(f"{src} ({src_fmt}) -> {dst} ({dst_fmt})")
+    return True
+
+
+def menu_disk_image_converter():
+    """Batch disk image format converter (qemu-img wrapper)."""
+    header("DISK IMAGE CONVERTER (qemu-img)")
+
+    qemu_img_bin = _qimg_resolve_binary()
+    if not qemu_img_bin:
+        warn("qemu-img.exe was not selected. Returning to main menu.")
+        pause()
+        return
+
+    jobs = []
+
+    while True:
+        job = _qimg_build_job()
+        if job:
+            jobs.append(job)
+            ok(f"Job queued ({len(jobs)} total):")
+            print(f"    {job['src_path']}  [{job['src_format']}]")
+            print(f"    -> {job['out_path']}  [{job['dst_format']}]")
+        else:
+            warn("Job not added.")
+
+        if not yesno_dialog("Disk Image Converter", "Convert another file?"):
+            break
+
+    if not jobs:
+        info("No jobs queued. Returning to main menu.")
+        pause()
+        return
+
+    subheader(f"Running {len(jobs)} Conversion Job(s)")
+
+    results = []
+    for i, job in enumerate(jobs, 1):
+        print(f"\n  [{i}/{len(jobs)}] {os.path.basename(job['src_path'])} "
+              f"({job['src_format']} -> {job['dst_format']})")
+        results.append((job, _qimg_run_job(job, qemu_img_bin)))
+
+    subheader("Summary")
+    for job, success in results:
+        status = "OK" if success else "FAILED"
+        if success:
+            ok(f"{job['src_path']} -> {job['out_path']}")
+        else:
+            err(f"{job['src_path']} -> {job['out_path']}")
+
+    pause()
+
+
 def main():
     if not IS_WINDOWS:
         err("This tool is designed for Windows systems only.")
@@ -6349,6 +6731,9 @@ def main():
         print(f"  {_c(C.CYAN,'[11]')} CSV Splitter        {_c(C.DIM,'split large CSVs by size or line count')}")
         print(f"  {_c(C.CYAN,'[12]')} CSV Timestamp Cleaner  {_c(C.DIM,'normalise timestamps to DD/MM/YYYY HH:MM:SS')}")
         print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── DISK IMAGES ─────────────────────────────')}")
+        print(f"  {_c(C.CYAN,'[13]')} Disk Image Converter  {_c(C.DIM,'qemu-img batch convert (raw/qcow2/vmdk/vhdx/...)')}")
+        print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         divider()
         choice = prompt("Select section:").strip()
@@ -6364,10 +6749,11 @@ def main():
         elif choice == "10": clear_screen(); menu_bodyfile_explorer()
         elif choice == "11": clear_screen(); menu_csv_splitter()
         elif choice == "12": clear_screen(); menu_csv_timestamp_cleaner()
+        elif choice == "13": clear_screen(); menu_disk_image_converter()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-12 or 0.")
+            err("Invalid choice. Enter 1-13 or 0.")
         clear_screen()
         print(BANNER)
 
