@@ -17,6 +17,7 @@ Sections:
   11. CSV Splitter           — split large CSV files by size or line count
   12. CSV Timestamp Cleaner  — normalise timestamps to DD/MM/YYYY HH:MM:SS
   13. Qemu menu              — convert forensic image formats
+  14. VolMenu                — Volatility3 menu wrapper
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -6695,6 +6696,702 @@ def menu_disk_image_converter():
     pause()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 14 — VOLATILITY 3 MEMORY ANALYSER (VolMenu)
+# ══════════════════════════════════════════════════════════════════
+# Merged from VolMenu by Jacob Wilson • dfirvault@gmail.com
+# All VolMenu functions are prefixed _vol_ to avoid name collisions.
+# Registry config lives under HKCU\Software\DFIRVault\VolMenu.
+
+import msvcrt as _vol_msvcrt  # Windows-only; already guarded by IS_WINDOWS check
+
+_VOL_REG_PATH      = r"Software\DFIRVault\VolMenu"
+_VOL_EXE_VALUE     = "VolExePath"
+_VOL_PARALLELISM   = "ParallelismMode"
+_VOL_VERBOSE       = "VerboseOutput"
+_VOL_SMARTCACHE    = "SmartCacheEnabled"
+_VOL_URL           = "https://github.com/volatilityfoundation/volatility3"
+_VOL_PARALLELISM_MODES = ["off", "processes", "threads"]
+
+_VOL_KEY_ESC   = b"\x1b"
+_VOL_KEY_SPACE = b" "
+_VOL_KEY_ENTER = (b"\r", b"\n")
+_VOL_KEY_UP    = (b"H", b"w")
+_VOL_KEY_DOWN  = (b"P", b"s")
+
+class _VolCancelled(Exception):
+    """Raised to unwind a configuration step back to the Volatility menu."""
+    pass
+
+# ── Plugin catalogue ───────────────────────────────────────────────
+_VOL_PLUGINS = {
+    "windows": [
+        "windows.info.Info", "windows.pslist.PsList", "windows.pstree.PsTree",
+        "windows.psscan.PsScan", "windows.dlllist.DllList", "windows.handles.Handles",
+        "windows.cmdline.CmdLine", "windows.netscan.NetScan", "windows.netstat.NetStat",
+        "windows.malfind.Malfind", "windows.modules.Modules", "windows.modscan.ModScan",
+        "windows.driverscan.DriverScan", "windows.svcscan.SvcScan",
+        "windows.registry.hivelist.HiveList", "windows.registry.printkey.PrintKey",
+        "windows.filescan.FileScan", "windows.dumpfiles.DumpFiles",
+        "windows.envars.Envars", "windows.getsids.GetSIDs", "windows.privileges.Privs",
+        "windows.sessions.Sessions", "windows.mutantscan.MutantScan",
+        "windows.symlinkscan.SymlinkScan", "windows.vadinfo.VadInfo",
+        "windows.memmap.Memmap", "windows.ssdt.SSDT",
+    ],
+    "linux": [
+        "linux.bash.Bash", "linux.pslist.PsList", "linux.pstree.PsTree",
+        "linux.psaux.PsAux", "linux.lsmod.Lsmod", "linux.lsof.Lsof",
+        "linux.malfind.Malfind", "linux.netstat.Netstat", "linux.proc.Maps",
+        "linux.elfs.Elfs", "linux.check_afinfo.Check_afinfo",
+        "linux.check_creds.Check_creds", "linux.check_idt.Check_idt",
+        "linux.check_syscall.Check_syscall", "linux.mountinfo.MountInfo",
+        "linux.tty_check.tty_check",
+    ],
+    "mac": [
+        "mac.pslist.PsList", "mac.pstree.PsTree", "mac.psaux.Psaux",
+        "mac.lsmod.Lsmod", "mac.lsof.Lsof", "mac.netstat.Netstat",
+        "mac.malfind.Malfind", "mac.bash.Bash", "mac.check_syscall.Check_syscall",
+        "mac.ifconfig.Ifconfig", "mac.mount.Mount", "mac.proc_maps.Maps",
+    ],
+}
+
+_VOL_OS_LABELS = {"windows": "Windows", "linux": "Linux", "mac": "Mac"}
+
+
+# ── Registry helpers (use DFIRVault's winreg import) ──────────────
+
+def _vol_reg_get(name, default=None):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _VOL_REG_PATH, 0, winreg.KEY_READ) as k:
+            value, _ = winreg.QueryValueEx(k, name)
+            return value
+    except FileNotFoundError:
+        return default
+
+def _vol_reg_set(name, value):
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _VOL_REG_PATH, 0, winreg.KEY_ALL_ACCESS) as k:
+        if isinstance(value, bool):
+            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, int(value))
+        elif isinstance(value, int):
+            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, value)
+        else:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(value))
+
+def _vol_reg_get_bool(name, default=False):
+    val = _vol_reg_get(name, None)
+    return default if val is None else bool(val)
+
+def _vol_reg_get_int(name, default=0):
+    val = _vol_reg_get(name, None)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+# ── vol.exe setup ─────────────────────────────────────────────────
+
+def _vol_prompt_for_exe():
+    """Show a file picker for vol.exe. Opens Volatility3 GitHub if cancelled."""
+    warn("Volatility 3 executable (vol.exe) not configured or not found.")
+    info("A file picker will open — please select your vol.exe file.")
+    pause("Press Enter to open the file picker…")
+    path = pick_file(
+        title="Select vol.exe",
+        filetypes=[("Volatility 3", "vol.exe"), ("All executables", "*.exe"), ("All files", "*.*")],
+    )
+    if not path:
+        info(f"Opening Volatility3 download page: {_VOL_URL}")
+        webbrowser.open(_VOL_URL)
+        return None
+    path = os.path.normpath(path)
+    _vol_reg_set(_VOL_EXE_VALUE, path)
+    ok(f"vol.exe saved: {path}")
+    return path
+
+def _vol_ensure_exe():
+    """Return the vol.exe path, prompting if missing/invalid."""
+    path = _vol_reg_get(_VOL_EXE_VALUE, None)
+    if path:
+        path = os.path.normpath(path)
+    if path and os.path.isfile(path):
+        return path
+    if path:
+        warn(f"Configured vol.exe path no longer exists: {path}")
+    return _vol_prompt_for_exe()
+
+def _vol_change_exe(current):
+    info(f"Current: {current}")
+    path = pick_file(
+        title="Select new vol.exe",
+        filetypes=[("Volatility 3", "vol.exe"), ("All executables", "*.exe"), ("All files", "*.*")],
+    )
+    if path:
+        path = os.path.normpath(path)
+        _vol_reg_set(_VOL_EXE_VALUE, path)
+        ok(f"vol.exe updated: {path}")
+        return path
+    warn("No file selected — keeping current path.")
+    return current
+
+
+# ── Performance settings ──────────────────────────────────────────
+
+def _vol_show_perf_menu():
+    while True:
+        header("VOLATILITY  —  PERFORMANCE SETTINGS")
+        mode_idx = _vol_reg_get_int(_VOL_PARALLELISM, 0)
+        if mode_idx < 0 or mode_idx >= len(_VOL_PARALLELISM_MODES):
+            mode_idx = 0
+        mode       = _VOL_PARALLELISM_MODES[mode_idx]
+        verbose    = _vol_reg_get_bool(_VOL_VERBOSE, False)
+        smartcache = _vol_reg_get_bool(_VOL_SMARTCACHE, True)
+        print()
+        print(f"  {_c(C.CYAN,'[1]')} Parallelism (--parallelism):  {_c(C.YELLOW, mode)}")
+        print(f"  {_c(C.CYAN,'[2]')} Verbose output (-vvv):        {_c(C.YELLOW, 'ON' if verbose else 'OFF')}")
+        print(f"  {_c(C.CYAN,'[3]')} Smart layer caching:          {_c(C.YELLOW, 'ON' if smartcache else 'OFF')}")
+        print(f"  {_c(C.RED, '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+        if ch == "1":
+            next_idx = (mode_idx + 1) % len(_VOL_PARALLELISM_MODES)
+            _vol_reg_set(_VOL_PARALLELISM, next_idx)
+            ok(f"Parallelism → {_VOL_PARALLELISM_MODES[next_idx]}")
+        elif ch == "2":
+            _vol_reg_set(_VOL_VERBOSE, not verbose)
+            ok(f"Verbose output {'enabled' if not verbose else 'disabled'}.")
+        elif ch == "3":
+            _vol_reg_set(_VOL_SMARTCACHE, not smartcache)
+            ok(f"Smart layer caching {'enabled' if not smartcache else 'disabled'}.")
+        elif ch == "0":
+            return
+        else:
+            err("Invalid choice.")
+        pause()
+
+def _vol_build_perf_args():
+    args = []
+    mode_idx = _vol_reg_get_int(_VOL_PARALLELISM, 0)
+    if 0 <= mode_idx < len(_VOL_PARALLELISM_MODES):
+        mode = _VOL_PARALLELISM_MODES[mode_idx]
+        if mode != "off":
+            args.extend(["--parallelism", mode])
+    if _vol_reg_get_bool(_VOL_VERBOSE, False):
+        args.append("-vvv")
+    if not _vol_reg_get_bool(_VOL_SMARTCACHE, True):
+        args.append("--no-symbol-cache")
+    return args
+
+
+# ── Checkbox-style plugin selector ────────────────────────────────
+
+def _vol_checkbox_menu(title, items, extra_options=None):
+    """DFIRVault-themed interactive checkbox menu for plugin selection.
+
+    Returns a list of selected indices, or a special key string from
+    extra_options.  Raises _VolCancelled if the user presses Esc/C.
+    """
+    extra_options = extra_options or []
+    selected  = [False] * len(items)
+    cursor    = 0
+    total_rows = len(items) + len(extra_options)
+
+    def render():
+        os.system("cls")
+        bar = C.HEAVY * 64
+        print(f"\n{_c(C.CYAN, bar)}")
+        print(f"{_c(C.CYAN, C.HEAVY)}{_c(C.BOLD+C.WHITE, ' ' * 20 + title[:22] + ' ' * 20)}{_c(C.CYAN, C.HEAVY)}")
+        print(f"{_c(C.CYAN, bar)}")
+        print()
+        for idx, label in enumerate(items):
+            box     = _c(C.GREEN,  "■") if selected[idx] else _c(C.DIM, "□")
+            pointer = _c(C.CYAN, "▶") if idx == cursor else " "
+            num     = _c(C.DIM, f"{idx+1:2d}.")
+            print(f"  {pointer} [{box}] {num} {label}")
+        print()
+        for offset, (label, _key) in enumerate(extra_options):
+            row = len(items) + offset
+            pointer = _c(C.CYAN, "▶") if row == cursor else " "
+            print(f"  {pointer}      {_c(C.BOLD+C.YELLOW, label)}")
+        print()
+        print(_c(C.DIM,
+            "  Space: toggle   Enter: confirm   A: select all/none   "
+            "↑/↓ or W/S: move   Esc/C: cancel"))
+
+    render()
+    while True:
+        key = _vol_msvcrt.getch()
+
+        if key == _VOL_KEY_ESC or key.lower() == b"c":
+            raise _VolCancelled()
+
+        if key in (b"\x00", b"\xe0"):
+            key2 = _vol_msvcrt.getch()
+            if key2 in _VOL_KEY_UP:
+                cursor = (cursor - 1) % total_rows
+            elif key2 in _VOL_KEY_DOWN:
+                cursor = (cursor + 1) % total_rows
+            render()
+            continue
+
+        if key.lower() == b"w":
+            cursor = (cursor - 1) % total_rows; render(); continue
+        if key.lower() == b"s":
+            cursor = (cursor + 1) % total_rows; render(); continue
+
+        if key == _VOL_KEY_SPACE:
+            if cursor < len(items):
+                selected[cursor] = not selected[cursor]
+            render()
+            continue
+
+        if key.lower() == b"a":
+            new_state = not all(selected)
+            selected  = [new_state] * len(items)
+            render()
+            continue
+
+        if key in _VOL_KEY_ENTER:
+            if cursor >= len(items):
+                _, extra_key = extra_options[cursor - len(items)]
+                return extra_key
+            chosen = [i for i, s in enumerate(selected) if s]
+            if not chosen:
+                chosen = [cursor]
+            return chosen
+
+
+# ── Scan configuration helpers ────────────────────────────────────
+
+def _vol_select_memory_image():
+    subheader("Select Memory Image")
+    info("A file picker will open — select the memory image to analyse.")
+    info("(Type 'c' and Enter to cancel)")
+    raw = prompt("Press Enter to open picker or 'c' to cancel:").strip().lower()
+    if raw == "c":
+        raise _VolCancelled()
+    path = pick_file(
+        title="Select memory image",
+        filetypes=[
+            ("Memory images", "*.raw *.mem *.dmp *.vmem *.bin *.img *.lime"),
+            ("All files", "*.*"),
+        ],
+    )
+    if not path:
+        warn("No memory image selected.")
+        return None
+    return os.path.normpath(path)
+
+def _vol_select_output_dir():
+    subheader("Select Output Directory")
+    info("A folder picker will open — choose where to save results.")
+    info("(Type 'c' and Enter to cancel)")
+    raw = prompt("Press Enter to open picker or 'c' to cancel:").strip().lower()
+    if raw == "c":
+        raise _VolCancelled()
+    path = pick_folder("Select output directory for Volatility results")
+    if not path:
+        warn("No output directory selected.")
+        return None
+    return os.path.normpath(path)
+
+def _vol_select_target_os():
+    subheader("Target Operating System")
+    print(f"\n  {_c(C.CYAN,'[1]')} Windows")
+    print(f"  {_c(C.CYAN,'[2]')} Linux")
+    print(f"  {_c(C.CYAN,'[3]')} Mac")
+    print(f"  {_c(C.RED, '[0]')} Cancel")
+    divider()
+    while True:
+        ch = prompt("Choice:").strip()
+        if ch == "1": return "windows"
+        if ch == "2": return "linux"
+        if ch == "3": return "mac"
+        if ch == "0": raise _VolCancelled()
+        err("Invalid choice.")
+
+def _vol_select_plugins(target_os):
+    plugin_list = _VOL_PLUGINS[target_os]
+    result = _vol_checkbox_menu(
+        title=f"Select {_VOL_OS_LABELS[target_os]} Plugins",
+        items=list(plugin_list),
+        extra_options=[
+            ("Run ALL plugins", "ALL"),
+            ("Cancel — back to Volatility menu", "CANCEL"),
+        ],
+    )
+    if result == "CANCEL":
+        raise _VolCancelled()
+    if result == "ALL":
+        return list(plugin_list)
+    return [plugin_list[i] for i in result]
+
+def _vol_configure_scan():
+    """Walk through one scan configuration. Returns a job dict or None."""
+    image_path = _vol_select_memory_image()
+    if not image_path:
+        return None
+    output_dir = _vol_select_output_dir()
+    if not output_dir:
+        return None
+    target_os = _vol_select_target_os()
+    plugins   = _vol_select_plugins(target_os)
+    return {
+        "image_path": image_path,
+        "output_dir": output_dir,
+        "target_os":  target_os,
+        "plugins":    plugins,
+    }
+
+
+# ── HTML report generation ────────────────────────────────────────
+
+def _vol_generate_html_report(output_dir, job_info):
+    """Embed all plugin .txt outputs into a single searchable HTML report."""
+    import html as _html_mod
+    output_path = Path(output_dir)
+    txt_files = sorted(output_path.glob("*.txt"))
+    if not txt_files:
+        warn(f"No .txt result files found in {output_dir} — skipping HTML report.")
+        return
+
+    sections = []
+    for tf in txt_files:
+        stem  = tf.stem
+        title = stem.replace("_", " ").title()
+        try:
+            content = tf.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            content = f"Error reading file: {e}"
+        sections.append({"id": stem, "title": title, "filename": tf.name, "content": content})
+
+    html_parts = ["""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DFIRVault — Volatility Report</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,sans-serif;background:#0d1117;color:#cdd6f4;line-height:1.5}
+.container{display:flex;min-height:100vh}
+.toc{width:280px;background:#1e1e2e;border-right:1px solid #313244;position:fixed;height:100vh;overflow-y:auto}
+.toc h2{font-size:1rem;padding:1rem;background:#181825;border-bottom:1px solid #313244;color:#89b4fa;letter-spacing:.05em}
+.toc ul{list-style:none}
+.toc li{border-bottom:1px solid #181825}
+.toc a{display:block;padding:.5rem 1rem;text-decoration:none;color:#cdd6f4;font-size:.85rem;transition:all .2s}
+.toc a:hover{background:#313244;color:#89b4fa;padding-left:1.4rem}
+.content{margin-left:280px;flex:1;padding:2rem;max-width:calc(100% - 280px)}
+.report-section{background:#1e1e2e;border-radius:8px;border:1px solid #313244;margin-bottom:1.5rem;overflow:hidden}
+.section-header{background:#181825;padding:.8rem 1.2rem;cursor:pointer;user-select:none;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #313244}
+.section-header:hover{background:#313244}
+.section-header h2{font-size:1rem;font-weight:600;color:#89b4fa}
+.toggle-icon{color:#6c7086}
+.section-content{padding:1rem;overflow-x:auto}
+.section-content.collapsed{display:none}
+pre{background:#11111b;color:#cdd6f4;padding:1rem;border-radius:6px;font-family:'Courier New',monospace;font-size:.82rem;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;margin:0;border:1px solid #313244}
+.search-container{margin-bottom:1.5rem;background:#1e1e2e;padding:.75rem 1rem;border-radius:8px;border:1px solid #313244;display:flex;gap:.5rem;align-items:center}
+.search-container input{flex:1;padding:.5rem .8rem;border:1px solid #313244;border-radius:4px;font-size:1rem;background:#11111b;color:#cdd6f4}
+.search-container button{background:#89b4fa;color:#1e1e2e;border:none;padding:.5rem 1rem;border-radius:4px;cursor:pointer;font-weight:600}
+.search-container button:hover{background:#74c7ec}
+.highlight{background:#f9e2af;color:#1e1e2e}
+.meta{font-size:.8rem;color:#6c7086;margin-bottom:1rem;padding:.5rem 1rem;background:#11111b;border-radius:4px;border:1px solid #313244}
+.footer{text-align:center;margin-top:2rem;padding:1rem;color:#6c7086;font-size:.8rem}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="toc">
+<h2>⚡ DFIRVault Volatility Report</h2>
+<ul>"""]
+
+    for sec in sections:
+        html_parts.append(f'<li><a href="#{sec["id"]}">{_html_mod.escape(sec["title"])}</a></li>\n')
+
+    html_parts.append("""</ul>
+</div>
+<div class="content">
+<div class="meta">""")
+    html_parts.append(
+        f"Image: {_html_mod.escape(str(job_info.get('image_path','?')))} &nbsp;|&nbsp; "
+        f"OS: {_html_mod.escape(_VOL_OS_LABELS.get(job_info.get('target_os','?'),'?'))} &nbsp;|&nbsp; "
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; "
+        f"Plugins: {len(sections)}"
+    )
+    html_parts.append("""</div>
+<div class="search-container">
+<input type="text" id="searchInput" placeholder="Search across all plugin outputs…">
+<button id="searchButton">🔍 Search</button>
+<button id="clearSearch">✖ Clear</button>
+</div>
+""")
+    for sec in sections:
+        escaped = _html_mod.escape(sec["content"])
+        html_parts.append(f"""
+<div class="report-section" id="{sec['id']}">
+<div class="section-header" onclick="toggleSection(this)">
+<h2>{_html_mod.escape(sec['title'])}</h2>
+<span class="toggle-icon">▼</span>
+</div>
+<div class="section-content">
+<pre>{escaped}</pre>
+</div>
+</div>
+""")
+    html_parts.append("""
+<div class="footer">Generated by DFIRVault Volatility Analyser • dfirvault@gmail.com</div>
+</div>
+</div>
+<script>
+function toggleSection(header){
+  const content=header.nextElementSibling;
+  const icon=header.querySelector('.toggle-icon');
+  if(content.classList.contains('collapsed')){content.classList.remove('collapsed');icon.textContent='▼';}
+  else{content.classList.add('collapsed');icon.textContent='▶';}
+}
+function escapeHtml(text){const d=document.createElement('div');d.textContent=text;return d.innerHTML;}
+function escapeRegex(str){return str.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');}
+function performSearch(){
+  const query=document.getElementById('searchInput').value.trim();
+  clearHighlights();
+  if(!query)return;
+  const regex=new RegExp('('+escapeRegex(query)+')','gi');
+  document.querySelectorAll('.section-content pre').forEach(pre=>{
+    pre.innerHTML=pre.innerText.replace(regex,'<span class="highlight">$1</span>');
+  });
+}
+function clearHighlights(){
+  document.querySelectorAll('.section-content pre').forEach(pre=>{
+    pre.innerHTML=escapeHtml(pre.innerText);
+  });
+}
+document.getElementById('searchButton').addEventListener('click',performSearch);
+document.getElementById('clearSearch').addEventListener('click',()=>{
+  document.getElementById('searchInput').value='';clearHighlights();
+});
+document.getElementById('searchInput').addEventListener('keypress',(e)=>{if(e.key==='Enter')performSearch();});
+</script>
+</body>
+</html>
+""")
+
+    report_path = output_path / "volatility_report.html"
+    try:
+        report_path.write_text("".join(html_parts), encoding="utf-8")
+        ok(f"HTML report generated: {report_path}")
+        if IS_WINDOWS:
+            try: os.startfile(str(report_path))
+            except: pass
+    except Exception as e:
+        err(f"Failed to write HTML report: {e}")
+
+
+# ── Progress monitor ──────────────────────────────────────────────
+
+_VOL_PROGRESS_RE = re.compile(r"Progress:\s*([0-9]+(?:\.[0-9]+)?)\s*(.*)")
+
+def _vol_monitor_progress(out_file, stop_event, plugin_idx, total_plugins, job_idx, total_jobs):
+    last_pct = last_msg = None
+    while not stop_event.is_set():
+        time.sleep(0.5)
+        try:
+            with open(out_file, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except (FileNotFoundError, OSError):
+            continue
+        for line in reversed(lines):
+            m = _VOL_PROGRESS_RE.search(line)
+            if m:
+                pct, msg = m.group(1), m.group(2).strip()
+                if (pct, msg) != (last_pct, last_msg):
+                    last_pct, last_msg = pct, msg
+                    status = f"    {_c(C.CYAN, C.ARROW)} {pct}%"
+                    if msg: status += f"  {_c(C.DIM, msg)}"
+                    status += f"  {_c(C.DIM, f'[plugin {plugin_idx}/{total_plugins}, scan {job_idx}/{total_jobs}]')}"
+                    print(status)
+                break
+
+def _vol_clean_output(out_file):
+    try:
+        with open(out_file, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except (FileNotFoundError, OSError):
+        return
+    cleaned = []
+    blank_run = 0
+    for line in lines:
+        if line.lstrip().startswith("Progress"):
+            continue
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run > 1:
+                continue
+            cleaned.append(line)
+        else:
+            blank_run = 0
+            cleaned.append(line)
+    try:
+        with open(out_file, "w", encoding="utf-8", errors="replace") as fh:
+            fh.writelines(cleaned)
+    except OSError:
+        pass
+
+
+# ── Scan execution ────────────────────────────────────────────────
+
+def _vol_find_symbols_dir(vol_exe, target_os):
+    vol_dir   = Path(vol_exe).resolve().parent
+    candidate = vol_dir / "symbols" / target_os
+    return str(candidate) if candidate.is_dir() else None
+
+def _vol_run_scan_job(vol_exe, job, job_index, total_jobs):
+    image_path = os.path.normpath(job["image_path"])
+    output_dir = os.path.normpath(job["output_dir"])
+    plugins    = job["plugins"]
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    perf_args  = _vol_build_perf_args()
+    sym_dir    = _vol_find_symbols_dir(vol_exe, job["target_os"])
+    sym_args   = ["-s", os.path.normpath(sym_dir)] if sym_dir else []
+
+    subheader(f"Scan {job_index}/{total_jobs}  —  {os.path.basename(image_path)}  [{_VOL_OS_LABELS[job['target_os']]}]")
+    info(f"Symbols: {os.path.normpath(sym_dir) if sym_dir else 'none detected next to vol.exe'}")
+    info(f"Plugins: {len(plugins)}")
+    print()
+
+    total_plugins = len(plugins)
+    for plugin_idx, plugin in enumerate(plugins, start=1):
+        out_file = Path(output_dir) / f"{plugin.replace('.', '_')}.txt"
+        cmd = [vol_exe, *perf_args, *sym_args, "-f", image_path, plugin]
+
+        print(f"  {_c(C.CYAN, f'[{plugin_idx}/{total_plugins}]')} {plugin}")
+        info(f"Output → {out_file}")
+
+        try:
+            with open(out_file, "w", encoding="utf-8", errors="replace"):
+                pass
+            stop_event    = threading.Event()
+            monitor_thread = threading.Thread(
+                target=_vol_monitor_progress,
+                args=(out_file, stop_event, plugin_idx, total_plugins, job_index, total_jobs),
+                daemon=True,
+            )
+            monitor_thread.start()
+
+            cf = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+            with open(out_file, "a", encoding="utf-8", errors="replace") as fh:
+                proc = subprocess.Popen(
+                    cmd, stdout=fh, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, creationflags=cf,
+                )
+                returncode = proc.wait()
+
+            stop_event.set()
+            monitor_thread.join(timeout=2)
+            _vol_clean_output(out_file)
+
+            if returncode == 0:
+                ok(f"Done  ({plugin_idx}/{total_plugins})")
+            else:
+                warn(f"Exit code {returncode}  ({plugin_idx}/{total_plugins}) — see output file")
+        except Exception as exc:
+            err(f"Failed to run plugin: {exc}")
+
+    _vol_generate_html_report(output_dir, job)
+    ok(f"Scan {job_index}/{total_jobs} complete → {output_dir}")
+
+def _vol_run_queue(vol_exe, queue):
+    if not queue:
+        warn("Queue is empty — nothing to run.")
+        return
+    total_jobs = len(queue)
+    info(f"Starting {total_jobs} queued scan(s)…")
+    for idx, job in enumerate(queue, start=1):
+        _vol_run_scan_job(vol_exe, job, idx, total_jobs)
+        info(f"Overall: {idx}/{total_jobs} complete.")
+    ok("All queued scans complete.")
+
+
+# ── New scan workflow ─────────────────────────────────────────────
+
+def _vol_new_scan_workflow(vol_exe):
+    queue = []
+    while True:
+        try:
+            job = _vol_configure_scan()
+        except _VolCancelled:
+            warn("Cancelled. Returning to Volatility menu.")
+            if queue:
+                ch = prompt(f"You have {len(queue)} queued scan(s). Run them now? (y/n):").strip().lower()
+                if ch == "y":
+                    _vol_run_queue(vol_exe, queue)
+            return
+
+        if job is None:
+            warn("Scan configuration cancelled (nothing selected).")
+        else:
+            queue.append(job)
+            ok(f"Scan added to queue (position {len(queue)}).")
+            info(f"Image:   {job['image_path']}")
+            info(f"Output:  {job['output_dir']}")
+            info(f"OS:      {_VOL_OS_LABELS[job['target_os']]}")
+            info(f"Plugins: {len(job['plugins'])} selected")
+
+        again = prompt("Queue another scan? (y/n  or 'c' to cancel queue):").strip().lower()
+        if again == "c":
+            warn("Cancelled. Returning to Volatility menu.")
+            if queue:
+                ch = prompt(f"{len(queue)} scan(s) in queue — run them? (y/n):").strip().lower()
+                if ch == "y":
+                    _vol_run_queue(vol_exe, queue)
+            return
+        if again != "y":
+            break
+
+    _vol_run_queue(vol_exe, queue)
+    pause()
+
+
+# ── Main Volatility submenu ───────────────────────────────────────
+
+def menu_volatility():
+    """DFIRVault menu entry point for the Volatility 3 Memory Analyser."""
+    vol_exe = _vol_ensure_exe()
+    if not vol_exe:
+        err("vol.exe not configured. Cannot continue.")
+        pause()
+        return
+
+    while True:
+        header("VOLATILITY 3  —  MEMORY ANALYSER")
+        info(f"vol.exe: {vol_exe}")
+        print()
+        print(f"  {_c(C.CYAN,'[1]')} New scan  {_c(C.DIM,'configure + queue one or more memory analysis jobs')}")
+        print(f"  {_c(C.CYAN,'[2]')} Performance settings  {_c(C.DIM,'parallelism / verbosity / smart cache')}")
+        print(f"  {_c(C.CYAN,'[3]')} Change vol.exe location")
+        print(f"  {_c(C.RED, '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+        if ch == "1":
+            clear_screen()
+            _vol_new_scan_workflow(vol_exe)
+        elif ch == "2":
+            clear_screen()
+            _vol_show_perf_menu()
+        elif ch == "3":
+            vol_exe = _vol_change_exe(vol_exe)
+            pause()
+        elif ch == "0":
+            break
+        else:
+            err("Invalid choice.")
+            pause()
+        clear_screen()
+        header("VOLATILITY 3  —  MEMORY ANALYSER")
+
+
 def main():
     if not IS_WINDOWS:
         err("This tool is designed for Windows systems only.")
@@ -6734,6 +7431,9 @@ def main():
         print(f"  {_c(C.BOLD+C.WHITE, '─── DISK IMAGES ─────────────────────────────')}")
         print(f"  {_c(C.CYAN,'[13]')} Disk Image Converter  {_c(C.DIM,'qemu-img batch convert (raw/qcow2/vmdk/vhdx/...)')}")
         print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── MEMORY FORENSICS ────────────────────────')}")
+        print(f"  {_c(C.CYAN,'[14]')} Volatility 3 Analyser  {_c(C.DIM,'memory image analysis — plugin runner + HTML report')}")
+        print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         divider()
         choice = prompt("Select section:").strip()
@@ -6750,10 +7450,11 @@ def main():
         elif choice == "11": clear_screen(); menu_csv_splitter()
         elif choice == "12": clear_screen(); menu_csv_timestamp_cleaner()
         elif choice == "13": clear_screen(); menu_disk_image_converter()
+        elif choice == "14": clear_screen(); menu_volatility()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-13 or 0.")
+            err("Invalid choice. Enter 1-14 or 0.")
         clear_screen()
         print(BANNER)
 
