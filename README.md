@@ -12,6 +12,8 @@
 
 [Installation](#installation) • [Features](#features) • [Quick Start](#quick-start) • [Documentation](#documentation) • [Contributing](#contributing)
 
+# [Download](https://github.com/dfirvault/DFIRVault/releases)
+
 </div>
 
 ---
