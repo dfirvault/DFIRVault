@@ -205,6 +205,290 @@ class RegistryConfig:
 
 
 # ──────────────────────────────────────────────────────────────────
+# AUTO-UPDATE SYSTEM
+# Checks GitHub Releases API on startup and self-replaces the .exe
+# Registry key: HKCU\Software\DFIRVault\AutoUpdate
+#   SkipVersion  REG_SZ  — version tag to skip (e.g. "v0.7")
+# ──────────────────────────────────────────────────────────────────
+
+CURRENT_VERSION = "v0.6"          # ← hard-coded release tag
+_GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
+_UPDATE_REG_SECTION = "AutoUpdate"
+
+
+def _upd_parse_version(tag: str):
+    """Convert a tag like 'v0.6' → (0, 6).  Returns (0, 0) on failure."""
+    try:
+        nums = re.findall(r'\d+', tag)
+        return tuple(int(n) for n in nums)
+    except Exception:
+        return (0, 0)
+
+
+def _upd_newer(remote_tag: str, local_tag: str) -> bool:
+    """Return True if remote_tag is strictly newer than local_tag."""
+    return _upd_parse_version(remote_tag) > _upd_parse_version(local_tag)
+
+
+def _upd_show_error_dialog(message: str):
+    """Show a tkinter error popup (non-blocking approach via after())."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showerror("DFIRVault — Update Failed", message)
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _upd_kill_dfirvault_processes(own_pid: int):
+    """
+    Terminate all DFIRVault*.exe processes except our own PID.
+    Returns True when no other instances are running.
+    """
+    if not IS_WINDOWS:
+        return True
+    try:
+        # Ask tasklist for all DFIRVault processes
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq DFIRVault*.exe", "/FO", "CSV", "/NH"],
+            stderr=subprocess.DEVNULL, universal_newlines=True
+        )
+        pids_to_kill = []
+        for line in out.splitlines():
+            # Format: "DFIRVault.exe","12345","..."
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pid = int(parts[1])
+                if pid != own_pid:
+                    pids_to_kill.append(pid)
+
+        for pid in pids_to_kill:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        return True
+    except Exception:
+        return True  # best-effort — don't block the update
+
+
+def _upd_download_with_progress(url: str, dest_path: str) -> bool:
+    """Stream-download url to dest_path with a simple console progress bar."""
+    try:
+        import urllib.request as _ureq
+        import urllib.error as _uerr
+
+        req = _ureq.Request(url, headers={"User-Agent": "DFIRVault-Updater"})
+        with _ureq.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk = 65536
+            with open(dest_path, "wb") as fout:
+                while True:
+                    data = resp.read(chunk)
+                    if not data:
+                        break
+                    fout.write(data)
+                    downloaded += len(data)
+                    if total:
+                        progress_bar(downloaded, total,
+                                     label=f"{downloaded // 1048576} / {total // 1048576} MB")
+        print()
+        return True
+    except Exception as e:
+        err(f"Download error: {e}")
+        return False
+
+
+def check_for_updates():
+    """
+    Entry-point called from main() before the menu loop.
+    Silently returns if:
+      • not running as a frozen .exe
+      • no internet / GitHub unreachable
+      • already on latest version
+      • user previously chose to skip this version
+    """
+    # Only update frozen .exe builds
+    if not getattr(sys, "frozen", False):
+        return
+
+    own_exe = Path(sys.executable)
+    own_pid = os.getpid()
+
+    # ── 1. Fetch latest release from GitHub ───────────────────────
+    try:
+        import urllib.request as _ureq
+        import json as _json
+
+        req = _ureq.Request(
+            _GH_RELEASES_API,
+            headers={"User-Agent": "DFIRVault-Updater", "Accept": "application/vnd.github+json"}
+        )
+        with _ureq.urlopen(req, timeout=8) as resp:
+            release = _json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        # Network unavailable or rate-limited — silently skip
+        return
+
+    remote_tag = release.get("tag_name", "")
+    if not remote_tag:
+        return
+
+    # ── 2. Compare versions ───────────────────────────────────────
+    if not _upd_newer(remote_tag, CURRENT_VERSION):
+        return  # already up to date
+
+    # ── 3. Check skip-version registry preference ─────────────────
+    skip_ver = RegistryConfig.load_config(_UPDATE_REG_SECTION, "SkipVersion", "")
+    if skip_ver and skip_ver.strip().lower() == remote_tag.strip().lower():
+        return  # user already skipped this version
+
+    # ── 4. Find the .exe asset in the release ─────────────────────
+    exe_asset = None
+    for asset in release.get("assets", []):
+        name = asset.get("name", "").lower()
+        if name.endswith(".exe"):
+            exe_asset = asset
+            break
+
+    if not exe_asset:
+        return  # no .exe published for this release — nothing to do
+
+    dl_url   = exe_asset["browser_download_url"]
+    new_size  = exe_asset.get("size", 0)
+    body      = (release.get("body") or "")[:300].strip()
+
+    # ── 5. Prompt the user ────────────────────────────────────────
+    clear_screen()
+    header("UPDATE AVAILABLE")
+    print()
+    info(f"Current version : {_c(C.YELLOW, CURRENT_VERSION)}")
+    info(f"Latest version  : {_c(C.GREEN,  remote_tag)}")
+    if new_size:
+        info(f"Download size   : {new_size // 1048576} MB")
+    if body:
+        print()
+        print(f"  {_c(C.DIM, 'Release notes:')}")
+        for line in body.splitlines()[:6]:
+            print(f"    {_c(C.DIM, line)}")
+    print()
+    print(f"  {_c(C.CYAN,   '[1]')} Update now")
+    print(f"  {_c(C.YELLOW, '[2]')} Skip this version")
+    print(f"  {_c(C.RED,    '[3]')} Remind me later")
+    divider()
+    choice = prompt("Choice:").strip()
+
+    if choice == "2":
+        RegistryConfig.save_config(_UPDATE_REG_SECTION, "SkipVersion", remote_tag)
+        info(f"Version {remote_tag} will be skipped in future.")
+        time.sleep(1)
+        return
+
+    if choice != "1":
+        return  # "3" or anything else = remind later
+
+    # ── 6. Download the new .exe ──────────────────────────────────
+    subheader("Downloading Update")
+    tmp_dir  = Path(tempfile.mkdtemp(prefix="dfirvault_update_"))
+    new_exe  = tmp_dir / exe_asset["name"]
+    backup   = own_exe.with_suffix(".bak")
+
+    info(f"Downloading {remote_tag} from GitHub…")
+    if not _upd_download_with_progress(dl_url, str(new_exe)):
+        _upd_show_error_dialog(
+            f"DFIRVault could not download the update.\n\n"
+            f"Please download {remote_tag} manually from:\n"
+            f"https://github.com/dfirvault/DFIRVault/releases"
+        )
+        return
+
+    ok(f"Download complete → {new_exe}")
+
+    # ── 7. Confirm all DFIRVault processes are closed ─────────────
+    subheader("Preparing to Replace Executable")
+    warn("All other DFIRVault windows must be closed to complete the update.")
+    print()
+    print(f"  {_c(C.CYAN, '[1]')} Close all other DFIRVault instances and continue")
+    print(f"  {_c(C.RED,  '[0]')} Cancel update")
+    divider()
+    if prompt("Choice:").strip() != "1":
+        warn("Update cancelled.")
+        try: shutil.rmtree(tmp_dir, ignore_errors=True)
+        except: pass
+        return
+
+    info("Terminating other DFIRVault processes…")
+    _upd_kill_dfirvault_processes(own_pid)
+
+    # ── 8. Backup old exe, replace with new ──────────────────────
+    subheader("Installing Update")
+    rollback_needed = False
+    try:
+        # Back up current executable
+        if backup.exists():
+            backup.unlink()
+        shutil.copy2(str(own_exe), str(backup))
+        ok(f"Backup saved → {backup.name}")
+
+        # Replace — on Windows the running .exe is locked, so we use a
+        # cmd /c ping delay trick to overwrite after this process exits.
+        replace_bat = tmp_dir / "replace.bat"
+        replace_bat.write_text(
+            f'@echo off\n'
+            f'ping 127.0.0.1 -n 3 >nul\n'
+            f'copy /Y "{new_exe}" "{own_exe}" >nul\n'
+            f'start "" "{own_exe}"\n'
+            f'del "%~f0"\n',
+            encoding="ascii"
+        )
+
+        subprocess.Popen(
+            ["cmd", "/c", str(replace_bat)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True
+        )
+
+        ok(f"Update to {remote_tag} initiated — relaunching DFIRVault…")
+        time.sleep(1)
+        sys.exit(0)
+
+    except Exception as exc:
+        rollback_needed = True
+        err(f"Update failed: {exc}")
+
+    # ── 9. Rollback on failure ────────────────────────────────────
+    if rollback_needed:
+        warn("Rolling back to previous version…")
+        try:
+            if backup.exists():
+                shutil.copy2(str(backup), str(own_exe))
+                ok("Rollback successful — original executable restored.")
+        except Exception as rb_exc:
+            err(f"Rollback also failed: {rb_exc}")
+            err(f"Manual recovery: rename '{backup}' → '{own_exe}'")
+
+        try: shutil.rmtree(tmp_dir, ignore_errors=True)
+        except: pass
+
+        _upd_show_error_dialog(
+            f"DFIRVault failed to install the update to {remote_tag}.\n\n"
+            f"The previous version ({CURRENT_VERSION}) has been restored.\n\n"
+            f"Error: {exc}\n\n"
+            f"You can download the update manually from:\n"
+            f"https://github.com/dfirvault/DFIRVault/releases"
+        )
+        # Relaunch the old version
+        try:
+            subprocess.Popen([str(own_exe)], close_fds=True)
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+
+# ──────────────────────────────────────────────────────────────────
 # GLOBAL UI HELPERS
 # ──────────────────────────────────────────────────────────────────
 class C:
@@ -7397,6 +7681,7 @@ def main():
         err("This tool is designed for Windows systems only.")
         sys.exit(1)
     
+    check_for_updates()
     clear_screen()
     print(BANNER)
     while True:
