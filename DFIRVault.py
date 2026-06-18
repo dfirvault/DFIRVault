@@ -211,7 +211,7 @@ class RegistryConfig:
 #   SkipVersion  REG_SZ  — version tag to skip (e.g. "v0.7")
 # ──────────────────────────────────────────────────────────────────
 
-CURRENT_VERSION = "v0.6"          # ← hard-coded release tag
+CURRENT_VERSION = "v0.6.1"          # ← hard-coded release tag
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 
