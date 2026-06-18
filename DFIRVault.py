@@ -217,12 +217,16 @@ _UPDATE_REG_SECTION = "AutoUpdate"
 
 
 def _upd_parse_version(tag: str):
-    """Convert a tag like 'v0.6' → (0, 6).  Returns (0, 0) on failure."""
+    """Convert a tag like 'v0.6' → (0, 6) or 'v0.6.1' → (0, 6, 1).  
+    Returns (0, 0, 0) on failure."""
     try:
         nums = re.findall(r'\d+', tag)
-        return tuple(int(n) for n in nums)
+        # Pad the tuple to ensure at least 3 elements for proper comparison
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(int(n) for n in nums[:3])
     except Exception:
-        return (0, 0)
+        return (0, 0, 0)
 
 
 def _upd_newer(remote_tag: str, local_tag: str) -> bool:
