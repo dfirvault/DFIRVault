@@ -300,53 +300,83 @@ def _upd_write_and_launch_bat(own_exe: Path, new_exe: Path):
       1. taskkill /F /IM <exe_name> — kill all running instances
       2. Loop until file lock is released (robust replace)
       3. move /Y <new_exe> <own_exe>
-      4. start "" <own_exe>
+      4. Launch the updated executable
       5. del "%~f0"
     """
     bat_path = Path(os.environ.get("TEMP", str(own_exe.parent))) / "dfirvault_update.bat"
     exe_name = own_exe.name
+    
+    # Get the directory and filename for proper launching
+    exe_dir = str(own_exe.parent)
+    exe_filename = own_exe.name
 
-    bat = (
-        "@echo off\n"
-        "setlocal\n"
-        "\n"
-        f'set "TARGET={own_exe}"\n'
-        f'set "NEWFILE={new_exe}"\n'
-        'set "SELF=%~f0"\n'
-        "\n"
-        ":: ── Kill all running DFIRVault instances ──────────────────\n"
-        f'taskkill /F /IM "{exe_name}" /T >nul 2>&1\n'
-        "\n"
-        ":: ── Wait until the old exe file-lock is released ──────────\n"
-        ":waitloop\n"
-        "timeout /t 1 /nobreak >nul\n"
-        '2>nul (\n'
-        '    >>"%TARGET%" echo off\n'
-        ') || goto waitloop\n'
-        "\n"
-        ":: ── Replace the exe ────────────────────────────────────────\n"
-        'move /Y "%NEWFILE%" "%TARGET%" >nul\n'
-        "if errorlevel 1 (\n"
-        "    echo Update failed: could not replace executable.\n"
-        "    pause\n"
-        "    goto cleanup\n"
-        ")\n"
-        "\n"
-        ":: ── Start updated DFIRVault ─────────────────────────────────\n"
-        'start "" "%TARGET%"\n'
-        "\n"
-        ":cleanup\n"
-        ":: ── Delete this batch file ──────────────────────────────────\n"
-        'del /F /Q "%SELF%"\n'
-    )
+    bat = f'''@echo off
+setlocal enabledelayedexpansion
 
-    bat_path.write_text(bat, encoding="ascii")
+:: ── Configuration ──────────────────────────────────────────────────
+set "TARGET={exe_dir}\\{exe_filename}"
+set "NEWFILE={new_exe}"
+set "SELF=%~f0"
+set "EXE_DIR={exe_dir}"
 
-    subprocess.Popen(
-        ["cmd.exe", "/c", str(bat_path)],
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-    )
+:: ── Kill all running DFIRVault instances ──────────────────────────
+echo [*] Killing existing DFIRVault processes...
+taskkill /F /IM "{exe_filename}" /T >nul 2>&1
+
+:: ── Wait until the old exe file-lock is released ──────────────────
+:waitloop
+timeout /t 1 /nobreak >nul
+2>nul (
+    >>"%TARGET%" echo off
+) || goto waitloop
+
+:: ── Replace the exe ────────────────────────────────────────────────
+echo [*] Replacing executable...
+move /Y "%NEWFILE%" "%TARGET%" >nul
+if errorlevel 1 (
+    echo [X] Update failed: could not replace executable.
+    pause
+    goto cleanup
+)
+
+:: ── Start updated DFIRVault ────────────────────────────────────────
+echo [*] Starting updated DFIRVault...
+start "" /D "%EXE_DIR%" "%TARGET%"
+
+:: ── Verify the process started ────────────────────────────────────
+timeout /t 2 /nobreak >nul
+tasklist /FI "IMAGENAME eq {exe_filename}" 2>nul | find /I "{exe_filename}" >nul
+if errorlevel 1 (
+    echo [W] Could not verify process start. Trying alternative launch...
+    start "" "%TARGET%"
+)
+
+:cleanup
+:: ── Delete this batch file ──────────────────────────────────────
+del /F /Q "%SELF%"
+'''
+
+    # Use utf-8 encoding to handle non-ASCII characters in paths
+    bat_path.write_text(bat, encoding="utf-8")
+
+    # Launch the batch file in a way that ensures it runs independently
+    try:
+        # Use a simpler Popen approach that's more reliable
+        subprocess.Popen(
+            f'start "" /B "{bat_path}"',
+            shell=True,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            cwd=str(own_exe.parent)
+        )
+    except Exception as e:
+        # Fallback to the original method
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(bat_path)],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            cwd=str(own_exe.parent)
+        )
 
 
 def check_for_updates():
