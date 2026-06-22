@@ -211,7 +211,7 @@ class RegistryConfig:
 #   SkipVersion  REG_SZ  — version tag to skip (e.g. "v0.7")
 # ──────────────────────────────────────────────────────────────────
 
-CURRENT_VERSION = "v0.6.1"          # ← hard-coded release tag
+CURRENT_VERSION = "v0.6.2"          # ← hard-coded release tag
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 
@@ -1680,7 +1680,7 @@ def menu_splunk():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SECTION 6 — CSV → ELASTICSEARCH (CSV2ELK)
+#  SECTION 6 — CSV → ELASTICSEARCH (CSV2ELK)  v0.3
 # ══════════════════════════════════════════════════════════════════
 
 # Lazy-import pandas and requests only when this section runs
@@ -1697,7 +1697,7 @@ def _elk_load_heavy():
 def _elk_load_config():
     """Load ELK config from registry"""
     config = {
-        "url": RegistryConfig.load_config("Elasticsearch", "url", ""),
+        "url":      RegistryConfig.load_config("Elasticsearch", "url",      ""),
         "username": RegistryConfig.load_config("Elasticsearch", "username", ""),
         "password": RegistryConfig.load_config("Elasticsearch", "password", "")
     }
@@ -1705,7 +1705,7 @@ def _elk_load_config():
 
 def _elk_save_config(url, user, pw):
     """Save ELK config to registry"""
-    RegistryConfig.save_config("Elasticsearch", "url", url)
+    RegistryConfig.save_config("Elasticsearch", "url",      url)
     RegistryConfig.save_config("Elasticsearch", "username", user)
     RegistryConfig.save_config("Elasticsearch", "password", pw)
 
@@ -1747,14 +1747,15 @@ def _elk_get_indices(url, user, pw, req):
     r = req.get(f"{url}/_cat/indices?h=index,docs.count,store.size&format=json",
                 auth=(user, pw), verify=False)
     if r.status_code == 200:
-        return [i for i in r.json() if not (i["index"].startswith(".") or i["index"].startswith("log"))]
+        return [i for i in r.json()
+                if not (i["index"].startswith(".") or i["index"].startswith("log"))]
     err("Error retrieving index info."); return []
 
 def _elk_create_index(url, user, pw, base_name, req):
-    base_name = _elk_sanitize_index(base_name)
-    today = datetime.today().strftime("%Y%m%d")
+    base_name  = _elk_sanitize_index(base_name)
+    today      = datetime.today().strftime("%Y%m%d")
     index_name = f"{base_name}_{today}"
-    mapping = {"mappings": {"properties": {"timestamp_field": {"type": "date"}}}}
+    mapping    = {"mappings": {"properties": {"timestamp_field": {"type": "date"}}}}
     r = req.put(f"{url}/{index_name}", auth=(user, pw),
                 headers={"Content-Type": "application/json"},
                 data=json.dumps(mapping), verify=False)
@@ -1764,8 +1765,23 @@ def _elk_create_index(url, user, pw, base_name, req):
         err(f"Failed to create index: {r.status_code} — {r.text}")
     return index_name
 
+def _elk_ensure_index_exists(url, user, pw, index_name, req):
+    """Create the index if it does not already exist. Returns True on success."""
+    r = req.head(f"{url}/{index_name}", auth=(user, pw), verify=False)
+    if r.status_code == 200:
+        return True
+    mapping = {"mappings": {"properties": {"timestamp_field": {"type": "date"}}}}
+    r2 = req.put(f"{url}/{index_name}", auth=(user, pw),
+                 headers={"Content-Type": "application/json"},
+                 data=json.dumps(mapping), verify=False)
+    if r2.status_code in (200, 201):
+        ok(f"Index '{index_name}' created.")
+        return True
+    err(f"Could not create index '{index_name}': {r2.status_code} — {r2.text}")
+    return False
+
 def _elk_guess_ts(columns):
-    priority = ["timestamp","@timestamp","time","datetime","date"]
+    priority = ["timestamp", "@timestamp", "time", "datetime", "date"]
     for p in priority:
         for col in columns:
             if re.search(p, col, re.IGNORECASE):
@@ -1794,8 +1810,7 @@ def _elk_convert_csv(csv_path, index_name, ts_col, pd):
     try:
         df = pd.read_csv(csv_path, encoding="utf-8", low_memory=False, on_bad_lines="warn")
         df = df.where(pd.notnull(df), None)
-        seen = {}
-        dedup_cols = []
+        seen = {}; dedup_cols = []
         for col in df.columns:
             if col not in seen:
                 seen[col] = 0; dedup_cols.append(col)
@@ -1805,8 +1820,8 @@ def _elk_convert_csv(csv_path, index_name, ts_col, pd):
         df.columns = [_elk_sanitize_col(c) for c in df.columns]
 
         def clean(obj):
-            if isinstance(obj, dict): return {k: clean(v) for k, v in obj.items()}
-            if isinstance(obj, list): return [clean(v) for v in obj]
+            if isinstance(obj, dict):  return {k: clean(v) for k, v in obj.items()}
+            if isinstance(obj, list):  return [clean(v) for v in obj]
             if isinstance(obj, float):
                 if pd.isna(obj) or obj in (float("inf"), float("-inf")): return None
             return obj
@@ -1816,15 +1831,16 @@ def _elk_convert_csv(csv_path, index_name, ts_col, pd):
         print()
         with open(json_path, "w", encoding="utf-8") as f:
             for i, (_, row) in enumerate(df.iterrows(), 1):
-                action = {"index": {"_index": index_name}}
+                action   = {"index": {"_index": index_name}}
                 f.write(json.dumps(action, ensure_ascii=False) + "\n")
                 row_dict = row.to_dict()
                 if ts_col and ts_col in row_dict:
                     tv = row_dict[ts_col]
                     if pd.notna(tv) and str(tv).strip():
                         try:
-                            tf = float(tv)
-                            iso = (datetime.utcfromtimestamp(tf/1000 if tf > 1e12 else tf).isoformat() + "Z")
+                            tf  = float(tv)
+                            iso = (datetime.utcfromtimestamp(tf / 1000 if tf > 1e12 else tf)
+                                   .isoformat() + "Z")
                             row_dict["timestamp_field"] = iso
                         except:
                             try:
@@ -1841,7 +1857,7 @@ def _elk_convert_csv(csv_path, index_name, ts_col, pd):
 
 def _elk_upload(url, user, pw, index_name, json_path, req):
     info("Uploading to Elasticsearch in chunks…")
-    chunk_size = 10000
+    chunk_size = 10_000
     def chunks():
         with open(json_path, "r", encoding="utf-8") as f:
             chunk = []
@@ -1851,7 +1867,7 @@ def _elk_upload(url, user, pw, index_name, json_path, req):
                     yield "".join(chunk); chunk = []
             if chunk: yield "".join(chunk)
     all_chunks = list(chunks())
-    total = len(all_chunks)
+    total      = len(all_chunks)
     print()
     success = True
     for i, chunk in enumerate(all_chunks, 1):
@@ -1859,7 +1875,7 @@ def _elk_upload(url, user, pw, index_name, json_path, req):
         for attempt in range(1, 31):
             try:
                 r = req.post(f"{url}/{index_name}/_bulk", auth=(user, pw),
-                             headers={"Content-Type":"application/x-ndjson"},
+                             headers={"Content-Type": "application/x-ndjson"},
                              data=chunk.encode("utf-8"), verify=False, timeout=10)
                 if r.status_code in (200, 201):
                     break
@@ -1890,7 +1906,8 @@ def _elk_pick_index(url, user, pw, req):
     print(f"  {_c(C.RED,'[0]')} Return to menu")
     for i, e in enumerate(indices, 1):
         docs = f"{int(e['docs.count']):,}"
-        print(f"  {_c(C.CYAN,f'[{i}]')} {e['index']}  {_c(C.DIM, docs + ' docs  ' + e['store.size'])}")
+        print(f"  {_c(C.CYAN,f'[{i}]')} {e['index']}  "
+              f"{_c(C.DIM, docs + ' docs  ' + e['store.size'])}")
     print()
     raw = prompt("Select index:").strip()
     if raw == "0": return None
@@ -1898,6 +1915,300 @@ def _elk_pick_index(url, user, pw, req):
     except (ValueError, IndexError):
         err("Invalid selection."); return None
 
+
+# ──────────────────────────────────────────────────────────────────
+#  NEW ①  EXPORT INDEX → NDJSON ZIP
+# ──────────────────────────────────────────────────────────────────
+def _elk_export_index(url, user, pw, req):
+    """
+    Scroll through every document in a chosen index and write them as
+    NDJSON, then compress into a ZIP the user picks the destination for.
+
+    Output filename:  <index>_export_<YYYYMMDD_HHMMSS>.ndjson.zip
+    The ZIP contains a single file:  <index>_export.ndjson
+    """
+    subheader("Export Index → NDJSON ZIP")
+
+    # ── pick index ────────────────────────────────────────────────
+    idx = _elk_pick_index(url, user, pw, req)
+    if not idx:
+        return
+
+    # ── count docs so we can show a proper progress bar ──────────
+    count_r = req.get(f"{url}/{idx}/_count", auth=(user, pw), verify=False)
+    total_docs = 0
+    if count_r.status_code == 200:
+        total_docs = count_r.json().get("count", 0)
+    info(f"Index '{idx}' contains {total_docs:,} document(s).")
+
+    # ── pick destination folder ───────────────────────────────────
+    info("Select destination folder for the export…")
+    dest_folder = pick_folder("Select export destination")
+    if not dest_folder:
+        warn("Cancelled."); return
+
+    stamp      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ndjson_name = f"{idx}_export.ndjson"
+    zip_name    = f"{idx}_export_{stamp}.ndjson.zip"
+    zip_path    = os.path.join(dest_folder, zip_name)
+    tmp_ndjson  = os.path.join(dest_folder, ndjson_name)
+
+    # ── scroll API ───────────────────────────────────────────────
+    BATCH   = 1000
+    scroll  = "2m"
+    payload = {"query": {"match_all": {}}, "size": BATCH}
+
+    try:
+        info("Initialising scroll…")
+        r = req.post(f"{url}/{idx}/_search?scroll={scroll}",
+                     auth=(user, pw), verify=False,
+                     headers={"Content-Type": "application/json"},
+                     data=json.dumps(payload))
+        if r.status_code != 200:
+            err(f"Scroll init failed: {r.status_code} — {r.text}"); return
+
+        data      = r.json()
+        scroll_id = data.get("_scroll_id")
+        hits      = data.get("hits", {}).get("hits", [])
+        written   = 0
+        print()
+
+        with open(tmp_ndjson, "w", encoding="utf-8") as ndf:
+            while hits:
+                for doc in hits:
+                    ndf.write(json.dumps(doc["_source"], ensure_ascii=False) + "\n")
+                    written += 1
+                if total_docs:
+                    progress_bar(written, total_docs, label="Exporting docs")
+                else:
+                    print(f"\r  Exported {written:,} docs…", end="", flush=True)
+
+                # next scroll page
+                scroll_r = req.post(f"{url}/_search/scroll",
+                                    auth=(user, pw), verify=False,
+                                    headers={"Content-Type": "application/json"},
+                                    data=json.dumps({"scroll": scroll,
+                                                     "scroll_id": scroll_id}))
+                if scroll_r.status_code != 200:
+                    break
+                scroll_data = scroll_r.json()
+                scroll_id   = scroll_data.get("_scroll_id", scroll_id)
+                hits        = scroll_data.get("hits", {}).get("hits", [])
+
+        print()
+
+        # clear the scroll context (best-effort)
+        try:
+            req.delete(f"{url}/_search/scroll",
+                       auth=(user, pw), verify=False,
+                       headers={"Content-Type": "application/json"},
+                       data=json.dumps({"scroll_id": scroll_id}))
+        except: pass
+
+        # ── compress to zip ───────────────────────────────────────
+        info(f"Compressing {written:,} documents → {zip_name}…")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(tmp_ndjson, ndjson_name)
+
+        # clean up temp file
+        try: os.remove(tmp_ndjson)
+        except: pass
+
+        ok(f"Export complete: {written:,} docs → {zip_path}")
+        if IS_WINDOWS:
+            try: os.startfile(dest_folder)
+            except: pass
+
+    except Exception as e:
+        err(f"Export failed: {e}")
+        try: os.remove(tmp_ndjson)
+        except: pass
+
+
+# ──────────────────────────────────────────────────────────────────
+#  NEW ②  IMPORT NDJSON ZIP → INDEX
+# ──────────────────────────────────────────────────────────────────
+def _elk_import_index(url, user, pw, req):
+    """
+    Import documents from an NDJSON ZIP (or raw .ndjson) into an
+    Elasticsearch index chosen by the user. The target index is
+    created automatically if it does not already exist.
+
+    Expected file formats
+    ---------------------
+      • A .zip containing exactly one *.ndjson file  (produced by the
+        Export function above, or by any other Scroll-API dump)
+      • A plain .ndjson file where every line is one JSON document
+    """
+    subheader("Import NDJSON → Elasticsearch Index")
+
+    # ── pick source file ─────────────────────────────────────────
+    info("Select the NDJSON ZIP or plain NDJSON file to import…")
+    src_file = pick_file(
+        "Select NDJSON export file",
+        filetypes=[("NDJSON / ZIP", "*.zip *.ndjson"), ("All", "*.*")]
+    )
+    if not src_file:
+        warn("Cancelled."); return
+
+    # ── resolve the NDJSON content ────────────────────────────────
+    ndjson_path  = None
+    tmp_dir      = None
+    is_zip       = src_file.lower().endswith(".zip")
+
+    try:
+        if is_zip:
+            import tempfile as _tmp
+            tmp_dir = _tmp.mkdtemp(prefix="dfirvault_elk_import_")
+            with zipfile.ZipFile(src_file, "r") as zf:
+                ndjson_members = [n for n in zf.namelist() if n.endswith(".ndjson")]
+                if not ndjson_members:
+                    err("ZIP contains no .ndjson file."); return
+                if len(ndjson_members) > 1:
+                    print()
+                    for i, n in enumerate(ndjson_members, 1):
+                        print(f"  {_c(C.CYAN,f'[{i}]')} {n}")
+                    raw = prompt("Multiple NDJSON files found — select one:").strip()
+                    try:   member = ndjson_members[int(raw) - 1]
+                    except: err("Invalid selection."); return
+                else:
+                    member = ndjson_members[0]
+                info(f"Extracting '{member}'…")
+                zf.extract(member, tmp_dir)
+            ndjson_path = os.path.join(tmp_dir, member)
+        else:
+            ndjson_path = src_file
+
+        # count lines for the progress bar
+        info("Counting records…")
+        total_lines = sum(1 for _ in open(ndjson_path, "r", encoding="utf-8")
+                          if _.strip())
+        info(f"Found {total_lines:,} document(s) to import.")
+
+        # ── choose / create index ─────────────────────────────────
+        subheader("Target Index")
+        indices = _elk_get_indices(url, user, pw, req)
+        print()
+        print(f"  {_c(C.CYAN,'[N]')} Create a NEW index")
+        for i, e in enumerate(indices, 1):
+            docs = f"{int(e['docs.count']):,}"
+            print(f"  {_c(C.CYAN,f'[{i}]')} {e['index']}  "
+                  f"{_c(C.DIM, docs + ' docs  ' + e['store.size'])}")
+        print()
+
+        raw = prompt("Select existing index or 'N' for new:").strip().lower()
+        if raw == "n":
+            base = prompt("New index name:").strip()
+            if not base:
+                err("Index name cannot be empty."); return
+            index_name = _elk_sanitize_index(base)
+            # Offer to append today's date (matches the create-index convention)
+            if prompt(f"Append today's date? → '{index_name}_{datetime.today().strftime('%Y%m%d')}' (y/n):") \
+                    .lower().startswith("y"):
+                index_name = f"{index_name}_{datetime.today().strftime('%Y%m%d')}"
+        else:
+            try:
+                index_name = indices[int(raw) - 1]["index"]
+            except (ValueError, IndexError):
+                err("Invalid selection."); return
+
+        # ensure index exists (create if needed)
+        if not _elk_ensure_index_exists(url, user, pw, index_name, req):
+            return
+
+        info(f"Importing into index '{index_name}'…")
+
+        # ── bulk-upload in chunks ─────────────────────────────────
+        CHUNK_DOCS = 1000          # documents per bulk request
+        CHUNK_BYTES = 5 * 1024 * 1024  # 5 MB safety cap
+
+        imported = 0
+        errors   = 0
+        print()
+
+        def _flush_chunk(lines_buf):
+            nonlocal errors
+            # Build NDJSON bulk body: action + source per doc
+            bulk_body = ""
+            for line in lines_buf:
+                line = line.strip()
+                if not line: continue
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    errors += 1; continue
+                action = {"index": {"_index": index_name}}
+                bulk_body += json.dumps(action, ensure_ascii=False) + "\n"
+                bulk_body += json.dumps(doc,    ensure_ascii=False) + "\n"
+            if not bulk_body:
+                return
+
+            for attempt in range(1, 11):
+                try:
+                    r = req.post(f"{url}/_bulk",
+                                 auth=(user, pw),
+                                 headers={"Content-Type": "application/x-ndjson"},
+                                 data=bulk_body.encode("utf-8"),
+                                 verify=False, timeout=30)
+                    if r.status_code in (200, 201):
+                        resp = r.json()
+                        if resp.get("errors"):
+                            # count item-level errors but keep going
+                            for item in resp.get("items", []):
+                                if item.get("index", {}).get("error"):
+                                    errors += 1
+                        break
+                    if attempt == 10:
+                        errors += len(lines_buf)
+                    else:
+                        time.sleep(min(2 ** attempt, 30))
+                except Exception:
+                    if attempt == 10:
+                        errors += len(lines_buf)
+                    else:
+                        time.sleep(min(2 ** attempt, 30))
+
+        chunk_buf = []
+        chunk_bytes = 0
+
+        with open(ndjson_path, "r", encoding="utf-8") as ndf:
+            for line in ndf:
+                if not line.strip():
+                    continue
+                chunk_buf.append(line)
+                chunk_bytes += len(line.encode("utf-8"))
+                imported += 1
+
+                if len(chunk_buf) >= CHUNK_DOCS or chunk_bytes >= CHUNK_BYTES:
+                    _flush_chunk(chunk_buf)
+                    chunk_buf  = []
+                    chunk_bytes = 0
+
+                if imported % 500 == 0 or imported == total_lines:
+                    progress_bar(imported, total_lines, label="Importing")
+
+        # flush remainder
+        if chunk_buf:
+            _flush_chunk(chunk_buf)
+            progress_bar(imported, total_lines, label="Importing")
+
+        print()
+        if errors:
+            warn(f"Import finished: {imported:,} docs processed, "
+                 f"{errors:,} error(s). Check Elasticsearch logs for details.")
+        else:
+            ok(f"Import complete: {imported:,} documents → '{index_name}'")
+
+    finally:
+        # always clean up the temp extraction directory
+        if tmp_dir:
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except: pass
+
+
+# ──────────────────────────────────────────────────────────────────
+#  UPDATED MAIN MENU  (option 4 = Export, option 5 = Import)
+# ──────────────────────────────────────────────────────────────────
 def menu_csv2elk():
     req, pd = _elk_load_heavy()
     if not req or not pd:
@@ -1917,11 +2228,13 @@ def menu_csv2elk():
     url, user, pw = _elk_ensure_connection(cfg, req)
 
     while True:
-        header("CSV → ELASTICSEARCH")
+        header("ELASTICSEARCH INDEX MANAGER")
         print(f"\n  {_c(C.DIM,'Endpoint:')} {_c(C.YELLOW, url)}\n")
         print(f"  {_c(C.CYAN,'[1]')} Create new index + upload CSV")
         print(f"  {_c(C.CYAN,'[2]')} Upload CSV to existing index")
         print(f"  {_c(C.CYAN,'[3]')} Delete index")
+        print(f"  {_c(C.CYAN,'[4]')} Export index → NDJSON ZIP")
+        print(f"  {_c(C.CYAN,'[5]')} Import NDJSON ZIP → index")
         print(f"  {_c(C.RED, '[0]')} Back")
         divider()
         ch = prompt("Choice:").strip()
@@ -1931,8 +2244,8 @@ def menu_csv2elk():
             idx   = _elk_create_index(url, user, pw, base, req)
             fpath = pick_file("Select CSV file", [("CSV","*.csv")])
             if not fpath: warn("No file selected."); continue
-            df = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
-            df = df.where(pd.notnull(df), None)
+            df     = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
+            df     = df.where(pd.notnull(df), None)
             ts_col = _elk_select_ts(df)
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
             if jpath: _elk_upload(url, user, pw, idx, jpath, req)
@@ -1942,8 +2255,8 @@ def menu_csv2elk():
             if not idx: continue
             fpath = pick_file("Select CSV file", [("CSV","*.csv")])
             if not fpath: warn("No file selected."); continue
-            df = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
-            df = df.where(pd.notnull(df), None)
+            df     = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
+            df     = df.where(pd.notnull(df), None)
             ts_col = _elk_select_ts(df)
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
             if jpath: _elk_upload(url, user, pw, idx, jpath, req)
@@ -1956,8 +2269,16 @@ def menu_csv2elk():
             else:
                 warn("Cancelled.")
 
-        elif ch == "0": break
-        else: err("Invalid choice.")
+        elif ch == "4":
+            _elk_export_index(url, user, pw, req)
+
+        elif ch == "5":
+            _elk_import_index(url, user, pw, req)
+
+        elif ch == "0":
+            break
+        else:
+            err("Invalid choice.")
         pause()
 
 
@@ -7698,10 +8019,10 @@ def main():
         print(f"  {_c(C.CYAN,'[4]')} Thor      {_c(C.DIM,'Drive / filesystem IOC scanner')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── SPLUNK ─────────────────────────────────')}")
-        print(f"  {_c(C.CYAN,'[5]')} Splunk Index Manager")
+        print(f"  {_c(C.CYAN,'[5]')} Splunk Index Manager {_c(C.DIM,'Manage indexes and upload data to Splunk')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── ELASTICSEARCH ──────────────────────────')}")
-        print(f"  {_c(C.CYAN,'[6]')} CSV → ELK  {_c(C.DIM,'upload CSV data to Elasticsearch')}")
+        print(f"  {_c(C.CYAN,'[6]')} ELK / Elasticsearch Manager  {_c(C.DIM,'Manage indexes and upload CSV data to Elasticsearch')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── FILE SYNC & TRANSFER ───────────────────')}")
         print(f"  {_c(C.CYAN,'[7]')} SFTP / FTP Monitor")
