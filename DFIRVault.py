@@ -8011,7 +8011,7 @@ def main():
     print(BANNER)
     while True:
         print(f"\n  {_c(C.BOLD+C.WHITE, '─── DFIR CASE MANAGEMENT ─────────────────')}")
-        print(f"  {_c(C.CYAN,'[1]')} DFIR Case Manager")
+        print(f"  {_c(C.CYAN,'[1]')} DFIR Case Manager"  {_c(C.DIM,'Create case folders locally, and zip archive to destination')})
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── SCANNING TOOLS ────────────────────────')}")
         print(f"  {_c(C.CYAN,'[2]')} Hayabusa  {_c(C.DIM,'EVTX log scanner — CSV + HTML reports')}")
@@ -8025,7 +8025,7 @@ def main():
         print(f"  {_c(C.CYAN,'[6]')} ELK / Elasticsearch Manager  {_c(C.DIM,'Manage indexes and upload CSV data to Elasticsearch')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── FILE SYNC & TRANSFER ───────────────────')}")
-        print(f"  {_c(C.CYAN,'[7]')} SFTP / FTP Monitor")
+        print(f"  {_c(C.CYAN,'[7]')} SFTP / FTP Monitor"  {_c(C.DIM,'Setup an SFTP monitor to either auto download or upload')})
         print(f"  {_c(C.CYAN,'[8]')} VaultMirror  {_c(C.DIM,'safe scheduled sync')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── THREAT INTELLIGENCE ────────────────────')}")
