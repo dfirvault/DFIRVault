@@ -2074,46 +2074,61 @@ def _elk_pick_index(url, user, pw, req):
 
 
 # ──────────────────────────────────────────────────────────────────
-#  NEW ①  EXPORT INDEX → NDJSON ZIP
+#  NEW ①  EXPORT INDEX → NDJSON ZIP  (multi-select queue)
 # ──────────────────────────────────────────────────────────────────
-def _elk_export_index(url, user, pw, req):
-    """
-    Scroll through every document in a chosen index and write them as
-    NDJSON, then compress into a ZIP the user picks the destination for.
 
-    Output filename:  <index>_export_<YYYYMMDD_HHMMSS>.ndjson.zip
-    The ZIP contains a single file:  <index>_export.ndjson
-    """
-    subheader("Export Index → NDJSON ZIP")
+def _elk_pick_indexes_multi(url, user, pw, req):
+    """Display the index list and return a list of selected index names.
+    Accepts comma-separated numbers, e.g. '1,3,5'. Returns [] on cancel."""
+    indices = _elk_get_indices(url, user, pw, req)
+    if not indices:
+        warn("No eligible indexes found."); return []
+    indices.sort(key=lambda x: _elk_date_from_index(x["index"]))
+    print()
+    print(f"  {_c(C.RED,'[0]')} Return to menu")
+    for i, e in enumerate(indices, 1):
+        docs = f"{int(e['docs.count']):,}"
+        print(f"  {_c(C.CYAN,f'[{i}]')} {e['index']}  "
+              f"{_c(C.DIM, docs + ' docs  ' + e['store.size'])}")
+    print()
+    info("Enter one or more index numbers separated by commas (e.g. 1,3,5)")
+    raw = prompt("Select indexes:").strip()
+    if raw == "0":
+        return []
+    selected = []
+    for part in raw.split(","):
+        part = part.strip()
+        try:
+            idx_entry = indices[int(part) - 1]["index"]
+            if idx_entry not in selected:
+                selected.append(idx_entry)
+        except (ValueError, IndexError):
+            warn(f"Skipping invalid selection: '{part}'")
+    return selected
 
-    # ── pick index ────────────────────────────────────────────────
-    idx = _elk_pick_index(url, user, pw, req)
-    if not idx:
-        return
 
-    # ── count docs so we can show a proper progress bar ──────────
-    count_r = req.get(f"{url}/{idx}/_count", auth=(user, pw), verify=False)
-    total_docs = 0
-    if count_r.status_code == 200:
-        total_docs = count_r.json().get("count", 0)
-    info(f"Index '{idx}' contains {total_docs:,} document(s).")
-
-    # ── pick destination folder ───────────────────────────────────
-    info("Select destination folder for the export…")
-    dest_folder = pick_folder("Select export destination")
-    if not dest_folder:
-        warn("Cancelled."); return
-
-    stamp      = datetime.now().strftime("%Y%m%d_%H%M%S")
+def _elk_export_single(url, user, pw, req, idx, dest_folder):
+    """Export one index to an NDJSON ZIP inside dest_folder.
+    Returns (success: bool, message: str)."""
+    stamp       = datetime.now().strftime("%Y%m%d_%H%M%S")
     ndjson_name = f"{idx}_export.ndjson"
     zip_name    = f"{idx}_export_{stamp}.ndjson.zip"
     zip_path    = os.path.join(dest_folder, zip_name)
     tmp_ndjson  = os.path.join(dest_folder, ndjson_name)
 
-    # ── scroll API ───────────────────────────────────────────────
+    # doc count for progress bar
+    total_docs = 0
+    try:
+        count_r = req.get(f"{url}/{idx}/_count", auth=(user, pw), verify=False)
+        if count_r.status_code == 200:
+            total_docs = count_r.json().get("count", 0)
+    except: pass
+    info(f"'{idx}' — {total_docs:,} document(s)")
+
     BATCH   = 1000
     scroll  = "2m"
     payload = {"query": {"match_all": {}}, "size": BATCH}
+    written = 0
 
     try:
         info("Initialising scroll…")
@@ -2122,12 +2137,11 @@ def _elk_export_index(url, user, pw, req):
                      headers={"Content-Type": "application/json"},
                      data=json.dumps(payload))
         if r.status_code != 200:
-            err(f"Scroll init failed: {r.status_code} — {r.text}"); return
+            return False, f"Scroll init failed: {r.status_code} — {r.text}"
 
         data      = r.json()
         scroll_id = data.get("_scroll_id")
         hits      = data.get("hits", {}).get("hits", [])
-        written   = 0
         print()
 
         with open(tmp_ndjson, "w", encoding="utf-8") as ndf:
@@ -2140,7 +2154,6 @@ def _elk_export_index(url, user, pw, req):
                 else:
                     print(f"\r  Exported {written:,} docs…", end="", flush=True)
 
-                # next scroll page
                 scroll_r = req.post(f"{url}/_search/scroll",
                                     auth=(user, pw), verify=False,
                                     headers={"Content-Type": "application/json"},
@@ -2154,7 +2167,7 @@ def _elk_export_index(url, user, pw, req):
 
         print()
 
-        # clear the scroll context (best-effort)
+        # clear scroll context (best-effort)
         try:
             req.delete(f"{url}/_search/scroll",
                        auth=(user, pw), verify=False,
@@ -2162,23 +2175,63 @@ def _elk_export_index(url, user, pw, req):
                        data=json.dumps({"scroll_id": scroll_id}))
         except: pass
 
-        # ── compress to zip ───────────────────────────────────────
-        info(f"Compressing {written:,} documents → {zip_name}…")
+        info(f"Compressing {written:,} docs → {zip_name}…")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_ndjson, ndjson_name)
 
-        # clean up temp file
         try: os.remove(tmp_ndjson)
         except: pass
 
-        ok(f"Export complete: {written:,} docs → {zip_path}")
-        if IS_WINDOWS:
-            try: os.startfile(dest_folder)
-            except: pass
+        return True, f"Export complete: {written:,} docs → {zip_path}"
 
     except Exception as e:
-        err(f"Export failed: {e}")
         try: os.remove(tmp_ndjson)
+        except: pass
+        return False, f"Export failed: {e}"
+
+
+def _elk_export_index(url, user, pw, req):
+    """
+    Multi-select export: scroll every selected index to an NDJSON ZIP.
+
+    Output filename:  <index>_export_<YYYYMMDD_HHMMSS>.ndjson.zip
+    The ZIP contains a single file:  <index>_export.ndjson
+    """
+    subheader("Export Index → NDJSON ZIP")
+
+    selected = _elk_pick_indexes_multi(url, user, pw, req)
+    if not selected:
+        return
+
+    print()
+    info(f"Selected {len(selected)} index(es) to export:")
+    for idx in selected:
+        print(f"    {_c(C.YELLOW, C.BULLET)} {idx}")
+    print()
+
+    info("Select destination folder for all exports…")
+    dest_folder = pick_folder("Select export destination")
+    if not dest_folder:
+        warn("Cancelled."); return
+
+    print()
+    subheader(f"Export Queue  [{len(selected)} index(es)]")
+    succeeded = []
+    failed    = []
+
+    for i, idx in enumerate(selected, 1):
+        print(f"\n  {_c(C.BOLD+C.WHITE, f'[{i}/{len(selected)}]')} {_c(C.CYAN, idx)}")
+        ok_flag, msg = _elk_export_single(url, user, pw, req, idx, dest_folder)
+        ok(msg) if ok_flag else err(msg)
+        (succeeded if ok_flag else failed).append(idx)
+
+    print()
+    divider()
+    ok(f"Export queue complete — {len(succeeded)} succeeded, {len(failed)} failed.")
+    if failed:
+        warn("Failed indexes: " + ", ".join(failed))
+    if succeeded and IS_WINDOWS:
+        try: os.startfile(dest_folder)
         except: pass
 
 
