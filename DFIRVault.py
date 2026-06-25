@@ -48,7 +48,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.3"
+CURRENT_VERSION  = "v0.6.4"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 
@@ -662,41 +662,8 @@ def case_create(case_folder):
         try: os.startfile(os.path.abspath(case_path))
         except: pass
 
-def case_archive(backup_location, case_folder):
-    subheader("Archive Case")
-    if not os.path.exists(case_folder):
-        err(f"Case folder not found: {case_folder}")
-        return
-    
-    folders = [f for f in os.listdir(case_folder) if os.path.isdir(os.path.join(case_folder, f))]
-    if not folders:
-        warn("No cases found in case folder.")
-        return
-    
-    print()
-    for i, f in enumerate(folders, 1):
-        print(f"  {_c(C.CYAN, f'[{i}]')} {f}")
-    print()
-    raw = prompt(f"Select case [1-{len(folders)}]:").strip()
-    try:
-        target = folders[int(raw) - 1]
-    except (ValueError, IndexError):
-        err("Invalid selection.")
-        return
-    
-    target_path = os.path.join(case_folder, target)
-    use_pw = prompt("Password-protect ZIP? (y/n):").lower().startswith("y")
-    pw = ""
-    if use_pw:
-        pw = prompt("ZIP password:").strip()
-        if not pw:
-            warn("No password — creating unprotected ZIP.")
-            use_pw = False
-    info("Select destination for ZIP…")
-    dst = pick_folder("Select backup destination")
-    if not dst:
-        warn("Cancelled.")
-        return
+def _case_archive_single(target, target_path, dst, use_pw, pw):
+    """Archive a single case folder to dst. Returns True on success."""
     zip_path = os.path.join(dst, f"{target}.zip")
     spinner(f"Archiving '{target}'…", 1.5)
     try:
@@ -712,12 +679,93 @@ def case_archive(backup_location, case_folder):
             spinner("Removing source folder…", 1.0)
             shutil.rmtree(target_path)
             ok(f"Archived → {zip_path}")
+            return True
         else:
-            err("Archive creation failed.")
+            err(f"Archive creation failed for '{target}'.")
+            return False
     except FileNotFoundError:
         warn("7-Zip unavailable — using standard ZIP.")
         shutil.make_archive(os.path.splitext(zip_path)[0], "zip", target_path)
         ok(f"Archived (no password) → {zip_path}")
+        return True
+
+
+def case_archive(backup_location, case_folder):
+    subheader("Archive Case(s)")
+    if not os.path.exists(case_folder):
+        err(f"Case folder not found: {case_folder}")
+        return
+
+    folders = [f for f in os.listdir(case_folder) if os.path.isdir(os.path.join(case_folder, f))]
+    if not folders:
+        warn("No cases found in case folder.")
+        return
+
+    print()
+    for i, f in enumerate(folders, 1):
+        print(f"  {_c(C.CYAN, f'[{i}]')} {f}")
+    print()
+    info("Enter one or more case numbers separated by commas (e.g. 1,3,5)")
+    raw = prompt(f"Select cases [1-{len(folders)}]:").strip()
+
+    selected_targets = []
+    for part in raw.split(","):
+        part = part.strip()
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(folders):
+                if folders[idx] not in selected_targets:
+                    selected_targets.append(folders[idx])
+            else:
+                warn(f"Skipping out-of-range selection: {part}")
+        except ValueError:
+            warn(f"Skipping invalid input: '{part}'")
+
+    if not selected_targets:
+        err("No valid cases selected.")
+        return
+
+    print()
+    info(f"Selected {len(selected_targets)} case(s) to archive:")
+    for t in selected_targets:
+        print(f"    {_c(C.YELLOW, C.BULLET)} {t}")
+    print()
+
+    use_pw = prompt("Password-protect ZIPs? (y/n):").lower().startswith("y")
+    pw = ""
+    if use_pw:
+        pw = prompt("ZIP password:").strip()
+        if not pw:
+            warn("No password entered — creating unprotected ZIPs.")
+            use_pw = False
+
+    info("Select destination folder for ZIPs…")
+    dst = pick_folder("Select backup destination")
+    if not dst:
+        warn("Cancelled.")
+        return
+
+    print()
+    subheader(f"Archive Queue  [{len(selected_targets)} case(s)]")
+    succeeded = []
+    failed = []
+    for i, target in enumerate(selected_targets, 1):
+        print(f"\n  {_c(C.BOLD+C.WHITE, f'[{i}/{len(selected_targets)}]')} {_c(C.CYAN, target)}")
+        target_path = os.path.join(case_folder, target)
+        if not os.path.exists(target_path):
+            err(f"Source folder missing — skipping: {target_path}")
+            failed.append(target)
+            continue
+        if _case_archive_single(target, target_path, dst, use_pw, pw):
+            succeeded.append(target)
+        else:
+            failed.append(target)
+
+    print()
+    divider()
+    ok(f"Archive queue complete — {len(succeeded)} succeeded, {len(failed)} failed.")
+    if failed:
+        warn("Failed cases: " + ", ".join(failed))
 
 def case_change_case_folder():
     """Change the case folder location"""
@@ -1616,13 +1664,98 @@ class SplunkManager:
             print(f"  {_c(C.CYAN,f'[{i}]')} {idx}")
         print(f"  {_c(C.RED,'[0]')} Back")
         print()
-        raw = prompt("Select index to manage:").strip()
+        info("Enter one or more index numbers separated by commas (e.g. 1,3,5)")
+        raw = prompt("Select indexes to manage:").strip()
         if raw == "0": return
-        try:
-            chosen = indexes[int(raw) - 1]
-        except (ValueError, IndexError):
-            err("Invalid selection."); return
-        self._index_ops(chosen)
+
+        selected = []
+        for part in raw.split(","):
+            part = part.strip()
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(indexes):
+                    if indexes[idx] not in selected:
+                        selected.append(indexes[idx])
+                else:
+                    warn(f"Skipping out-of-range selection: {part}")
+            except ValueError:
+                warn(f"Skipping invalid input: '{part}'")
+
+        if not selected:
+            err("No valid indexes selected."); return
+
+        if len(selected) == 1:
+            self._index_ops(selected[0])
+        else:
+            self._multi_index_ops(selected)
+
+    def _multi_index_ops(self, selected_displays):
+        """Handle a queued operation across multiple selected indexes."""
+        print()
+        info(f"Selected {len(selected_displays)} index(es):")
+        for d in selected_displays:
+            print(f"    {_c(C.YELLOW, C.BULLET)} {d}")
+        print()
+        subheader(f"Queued Operation — {len(selected_displays)} Indexes")
+        print(f"  {_c(C.CYAN,'[1]')} Delete all selected")
+        print(f"  {_c(C.CYAN,'[2]')} Backup all selected")
+        print(f"  {_c(C.CYAN,'[3]')} Backup + Delete all selected")
+        print(f"  {_c(C.RED, '[0]')} Cancel")
+        print()
+        ch = prompt("Action:").strip()
+        if ch == "0":
+            warn("Cancelled."); return
+
+        bdir = None
+        pw = None
+        if ch in ("2", "3"):
+            info("Select backup destination for all indexes…")
+            raw_path = prompt("Enter path (blank to browse):").strip()
+            bdir = raw_path or pick_folder("Select backup directory")
+            if not bdir:
+                warn("Cancelled."); return
+            if prompt("Password-protect backups? (y/n):").lower().startswith("y"):
+                pw = getpass.getpass(f"  {_c(C.MAGENTA, C.ARROW)} Backup password: ")
+
+        if ch == "1":
+            if not prompt(f"{_c(C.RED,'Permanently delete ALL')} {len(selected_displays)} selected indexes? (y/n):").lower().startswith("y"):
+                warn("Cancelled."); return
+        elif ch == "3":
+            if not prompt(f"{_c(C.RED,'Backup then permanently delete ALL')} {len(selected_displays)} selected indexes? (y/n):").lower().startswith("y"):
+                warn("Cancelled."); return
+
+        print()
+        succeeded = []
+        failed = []
+        for i, display in enumerate(selected_displays, 1):
+            name = display.split(" - ")[0].strip()
+            print(f"\n  {_c(C.BOLD+C.WHITE, f'[{i}/{len(selected_displays)}]')} {_c(C.CYAN, name)}")
+            if ch == "1":
+                ok_flag, msg = self.delete_index(name)
+                ok(msg) if ok_flag else err(msg)
+                (succeeded if ok_flag else failed).append(name)
+            elif ch == "2":
+                ok_flag, msg = self.backup_index(name, bdir, pw)
+                ok(msg) if ok_flag else err(msg)
+                (succeeded if ok_flag else failed).append(name)
+            elif ch == "3":
+                ok_flag, msg = self.backup_index(name, bdir, pw)
+                ok(msg) if ok_flag else err(msg)
+                if ok_flag:
+                    del_ok, del_msg = self.delete_index(name)
+                    ok(del_msg) if del_ok else err(del_msg)
+                    (succeeded if del_ok else failed).append(name)
+                else:
+                    warn(f"Skipping deletion of '{name}' — backup failed.")
+                    failed.append(name)
+            else:
+                warn("Invalid action — skipping."); return
+
+        print()
+        divider()
+        ok(f"Queue complete — {len(succeeded)} succeeded, {len(failed)} failed.")
+        if failed:
+            warn("Failed indexes: " + ", ".join(failed))
 
     def _index_ops(self, display):
         name = display.split(" - ")[0].strip()
