@@ -27,6 +27,7 @@ import os
 import re
 import json
 import sys
+import csv
 import math
 import time
 import shutil
@@ -48,9 +49,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.4"
+CURRENT_VERSION  = "v0.6.5"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
+# Increase CSV field size limit to handle large fields
+csv.field_size_limit(2147483647)
 
 # ── LogEnricher additional imports ────────────────────────────────
 import csv
@@ -360,23 +363,12 @@ del /F /Q "%SELF%"
     bat_path.write_text(bat, encoding="utf-8")
 
     # Launch the batch file in a way that ensures it runs independently
-    try:
-        # Use a simpler Popen approach that's more reliable
-        subprocess.Popen(
-            f'start "" /B "{bat_path}"',
-            shell=True,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-            cwd=str(own_exe.parent)
-        )
-    except Exception as e:
-        # Fallback to the original method
-        subprocess.Popen(
-            ["cmd.exe", "/c", str(bat_path)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-            cwd=str(own_exe.parent)
-        )
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(bat_path)],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+        cwd=str(own_exe.parent)
+    )
 
 
 def check_for_updates():
