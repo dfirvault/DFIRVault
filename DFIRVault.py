@@ -338,25 +338,23 @@ echo [*] Replacing executable...
 move /Y "%NEWFILE%" "%TARGET%" >nul
 if errorlevel 1 (
     echo [X] Update failed: could not replace executable.
-    pause
+    timeout /t 5 /nobreak >nul
     goto cleanup
 )
 
 :: ── Start updated DFIRVault ────────────────────────────────────────
+:: Use start /B to launch detached from this batch so the new exe
+:: does not inherit our restricted CREATE_NO_WINDOW handles.
 echo [*] Starting updated DFIRVault...
-start "" /D "%EXE_DIR%" "%TARGET%"
-
-:: ── Verify the process started ────────────────────────────────────
-timeout /t 2 /nobreak >nul
-tasklist /FI "IMAGENAME eq {exe_filename}" 2>nul | find /I "{exe_filename}" >nul
-if errorlevel 1 (
-    echo [W] Could not verify process start. Trying alternative launch...
-    start "" "%TARGET%"
-)
+start "" /D "%EXE_DIR%" /B "%TARGET%"
 
 :cleanup
-:: ── Delete this batch file ──────────────────────────────────────
+:: ── Delete this batch file ─────────────────────────────────────────
+:: exit /b 0 must follow immediately — if del runs and cmd then tries
+:: to read the next instruction from the now-deleted file it produces
+:: the spurious "The batch file cannot be found" error.
 del /F /Q "%SELF%"
+exit /b 0
 '''
 
     # Use utf-8 encoding to handle non-ASCII characters in paths
