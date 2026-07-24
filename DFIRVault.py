@@ -18,6 +18,7 @@ Sections:
   12. CSV Timestamp Cleaner  — normalise timestamps to DD/MM/YYYY HH:MM:SS
   13. Qemu menu              — convert forensic image formats
   14. VolMenu                — Volatility3 menu wrapper
+  15. JSON <-> CSV Converter — convert a file or folder between JSON and CSV
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -49,7 +50,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.5"
+CURRENT_VERSION  = "v0.6.6"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -8202,6 +8203,228 @@ def menu_volatility():
         header("VOLATILITY 3  —  MEMORY ANALYSER")
 
 
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 15 — JSON ⇄ CSV CONVERTER
+# ══════════════════════════════════════════════════════════════════
+
+def _jc_load_json_records(json_path):
+    """Load a JSON or JSON-Lines file and return a list of dict records."""
+    with open(json_path, "r", encoding="utf-8-sig") as f:
+        raw = f.read()
+
+    raw_stripped = raw.strip()
+    if not raw_stripped:
+        return []
+
+    try:
+        data = json.loads(raw_stripped)
+    except json.JSONDecodeError:
+        # Fall back to JSON-Lines (one JSON object per line)
+        records = []
+        for line in raw_stripped.splitlines():
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            records.append(json.loads(line))
+        return records
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        # Look for a single "records"/"data"/"results"-style wrapper list
+        list_fields = [v for v in data.values() if isinstance(v, list)]
+        if len(list_fields) == 1 and list_fields[0] and all(isinstance(i, dict) for i in list_fields[0]):
+            return list_fields[0]
+        # Otherwise treat the whole object as one row
+        return [data]
+
+    return [{"value": data}]
+
+
+def _jc_flatten_value(val):
+    """Convert non-scalar values to a JSON string so they fit safely in a CSV cell."""
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return val
+
+
+def _jc_json_to_csv(json_path, out_path):
+    records = _jc_load_json_records(json_path)
+    if not records:
+        raise ValueError("No records found in JSON file.")
+
+    # Union of keys across all records, preserving first-seen order
+    fieldnames = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            rec = {"value": rec}
+        for k in rec.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+
+    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore", restval="")
+        writer.writeheader()
+        for rec in records:
+            if not isinstance(rec, dict):
+                rec = {"value": rec}
+            writer.writerow({k: _jc_flatten_value(v) for k, v in rec.items()})
+
+    return len(records), fieldnames
+
+
+def _jc_csv_to_json(csv_path, out_path, pretty=True):
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        records = [dict(row) for row in reader]
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        if pretty:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+        else:
+            json.dump(records, f, ensure_ascii=False)
+
+    return len(records)
+
+
+def _jc_process_file(src_path, dest_format, output_dir):
+    """Convert a single file. Returns (status, message, out_path)."""
+    base = os.path.splitext(os.path.basename(src_path))[0]
+    ext  = os.path.splitext(src_path)[1].lower()
+
+    if dest_format == "csv":
+        if ext not in (".json", ".jsonl"):
+            return "skipped", f"Not a JSON file ({ext})", None
+        out_path = os.path.join(output_dir, base + ".csv")
+        try:
+            count, fields = _jc_json_to_csv(src_path, out_path)
+            return "ok", f"{count:,} record(s), {len(fields)} column(s)", out_path
+        except Exception as exc:
+            return "error", str(exc), None
+    else:  # dest_format == "json"
+        if ext != ".csv":
+            return "skipped", f"Not a CSV file ({ext})", None
+        out_path = os.path.join(output_dir, base + ".json")
+        try:
+            count = _jc_csv_to_json(src_path, out_path)
+            return "ok", f"{count:,} record(s)", out_path
+        except Exception as exc:
+            return "error", str(exc), None
+
+
+def menu_json_csv_converter():
+    header("JSON ⇄ CSV CONVERTER")
+    info("Convert JSON / JSON-Lines files to CSV, or CSV files to JSON")
+    print()
+
+    while True:
+        print(f"  {_c(C.CYAN, '[1]')} Convert a single file")
+        print(f"  {_c(C.CYAN, '[2]')} Convert a folder of files")
+        print(f"  {_c(C.RED,  '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+
+        if ch == "0":
+            break
+        elif ch not in ("1", "2"):
+            err("Invalid choice.")
+            continue
+
+        clear_screen()
+        header("JSON ⇄ CSV CONVERTER")
+
+        # ── source selection ────────────────────────────────────
+        src_files  = []
+        src_folder = None
+
+        if ch == "1":
+            info("Select source file…")
+            picked = pick_file("Select JSON or CSV file",
+                                filetypes=[("JSON / CSV files", "*.json *.jsonl *.csv"),
+                                           ("JSON files", "*.json *.jsonl"),
+                                           ("CSV files", "*.csv"),
+                                           ("All files", "*.*")])
+            if not picked:
+                warn("No file selected.")
+                pause(); continue
+            src_files  = [picked]
+            src_folder = os.path.dirname(picked)
+        else:
+            info("Select source folder…")
+            picked = pick_folder("Select Folder Containing JSON/CSV Files")
+            if not picked:
+                warn("No folder selected.")
+                pause(); continue
+            src_folder = picked
+            for fn in sorted(os.listdir(picked)):
+                fp = os.path.join(picked, fn)
+                if os.path.isfile(fp) and os.path.splitext(fn)[1].lower() in (".json", ".jsonl", ".csv"):
+                    src_files.append(fp)
+            if not src_files:
+                warn("No .json, .jsonl or .csv files found in that folder.")
+                pause(); continue
+            ok(f"Found {len(src_files)} candidate file(s).")
+
+        # ── destination format ──────────────────────────────────
+        print()
+        print(f"  {_c(C.CYAN, '[1]')} Convert to CSV   {_c(C.DIM, '(source: .json / .jsonl)')}")
+        print(f"  {_c(C.CYAN, '[2]')} Convert to JSON  {_c(C.DIM, '(source: .csv)')}")
+        divider()
+        fmt_choice = prompt("Destination format:").strip()
+        if fmt_choice == "1":
+            dest_format = "csv"
+        elif fmt_choice == "2":
+            dest_format = "json"
+        else:
+            err("Invalid selection."); pause(); continue
+
+        # ── output directory ────────────────────────────────────
+        print()
+        same_dir = prompt(f"Save output in the same folder as source? (y/n) [{src_folder}]:").strip().lower()
+        if same_dir == "y":
+            output_dir = src_folder
+        else:
+            info("Select output directory…")
+            output_dir = pick_folder("Select Output Directory")
+            if not output_dir:
+                warn("No output directory selected."); pause(); continue
+
+        # ── run conversion ──────────────────────────────────────
+        print()
+        subheader(f"Converting {len(src_files)} file(s)  →  {dest_format.upper()}")
+
+        results = []
+        for i, fp in enumerate(src_files, 1):
+            status, msg, out_path = _jc_process_file(fp, dest_format, output_dir)
+            results.append((fp, status, msg, out_path))
+            tag_colour, tag_label = {"ok": (C.GREEN, "OK"), "skipped": (C.YELLOW, "SKIP"), "error": (C.RED, "FAIL")}[status]
+            print(f"  [{i}/{len(src_files)}] {_c(tag_colour, f'[{tag_label}]')}  {os.path.basename(fp)}  {_c(C.DIM, msg)}")
+
+        ok_count      = sum(1 for r in results if r[1] == "ok")
+        skipped_count = sum(1 for r in results if r[1] == "skipped")
+        error_count   = sum(1 for r in results if r[1] == "error")
+
+        print()
+        subheader("Summary")
+        ok(f"Converted: {ok_count}")
+        if skipped_count:
+            warn(f"Skipped:   {skipped_count}")
+        if error_count:
+            err(f"Failed:    {error_count}")
+
+        if ok_count:
+            print()
+            info("Opening output folder…")
+            try:
+                os.startfile(output_dir)
+            except Exception:
+                pass
+
+        pause()
+
+
 def main():
     if not IS_WINDOWS:
         err("This tool is designed for Windows systems only.")
@@ -8245,6 +8468,9 @@ def main():
         print(f"  {_c(C.BOLD+C.WHITE, '─── MEMORY FORENSICS ────────────────────────')}")
         print(f"  {_c(C.CYAN,'[14]')} Volatility 3 Analyser  {_c(C.DIM,'memory image analysis — plugin runner + HTML report')}")
         print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── DATA CONVERSION ─────────────────────────')}")
+        print(f"  {_c(C.CYAN,'[15]')} JSON ⇄ CSV Converter  {_c(C.DIM,'convert a file or folder between JSON and CSV')}")
+        print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         print()
         print(f"  {_c(C.DIM, '─' * 58)}")
@@ -8265,10 +8491,11 @@ def main():
         elif choice == "12": clear_screen(); menu_csv_timestamp_cleaner()
         elif choice == "13": clear_screen(); menu_disk_image_converter()
         elif choice == "14": clear_screen(); menu_volatility()
+        elif choice == "15": clear_screen(); menu_json_csv_converter()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-14 or 0.")
+            err("Invalid choice. Enter 1-15 or 0.")
         clear_screen()
         print(BANNER)
 
