@@ -15,10 +15,11 @@ Sections:
   9. CSV Log Enricher        — enrich CSV logs with OTX / AbuseIPDB / IP2Location / Tor
   10. Body file to CSV       — convert a body file to CSV
   11. CSV Splitter           — split large CSV files by size or line count
-  12. CSV Timestamp Cleaner  — normalise timestamps to DD/MM/YYYY HH:MM:SS
+  12. CSV Timestamp Cleaner  — normalise timestamps to ISO-8601 or DD/MM/YYYY HH:MM:SS
   13. Qemu menu              — convert forensic image formats
   14. VolMenu                — Volatility3 menu wrapper
   15. JSON <-> CSV Converter — convert a file or folder between JSON and CSV
+  16. App Settings           — run on boot / minimize & close to system tray
 """
 
 # ──────────────────────────────────────────────────────────────────
@@ -50,7 +51,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.6"
+CURRENT_VERSION  = "v0.6.7"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -89,6 +90,13 @@ try:
     _TQDM_OK = True
 except ImportError:
     _TQDM_OK = False
+
+try:
+    import pystray
+    from PIL import Image as _TrayImage, ImageDraw as _TrayImageDraw
+    _TRAY_OK = True
+except ImportError:
+    _TRAY_OK = False
 
 if IS_WINDOWS:
     try:
@@ -632,14 +640,17 @@ def case_create(case_folder):
     # Create case in the tracked case folder
     case_path = os.path.join(case_folder, name)
     folders = [
-        f"{case_path}/01 - Evidence",
+        f"{case_path}/01 - Evidence/logs",
+        f"{case_path}/01 - Evidence/artefacts",
+        f"{case_path}/01 - Evidence/images",
+        f"{case_path}/01 - Evidence/malware",
         f"{case_path}/02 - Case",
-        f"{case_path}/03 - Malware",
-        f"{case_path}/04 - Extracted Evidence/01 - Axiom",
-        f"{case_path}/04 - Extracted Evidence/02 - XWays",
-        f"{case_path}/04 - Extracted Evidence/03 - Thor",
-        f"{case_path}/04 - Extracted Evidence/04 - Hayabusa",
-        f"{case_path}/04 - Extracted Evidence/05 - Chainsaw",
+        f"{case_path}/03 - Extracted Evidence/01 - Axiom",
+        f"{case_path}/03 - Extracted Evidence/02 - XWays",
+        f"{case_path}/03 - Extracted Evidence/03 - Thor",
+        f"{case_path}/03 - Extracted Evidence/04 - Hayabusa",
+        f"{case_path}/03 - Extracted Evidence/05 - Chainsaw",
+        f"{case_path}/04 - Report",
     ]
     print()
     for i, f in enumerate(folders, 1):
@@ -647,11 +658,46 @@ def case_create(case_folder):
         progress_bar(i, len(folders), label=f)
     print()
     open(f"{case_path}/Keywords.txt", "a").close()
+    open(f"{case_path}/Notes.txt", "a").close()
     ok(f"Case '{_c(C.BOLD, name)}' created at: {case_path}")
-    info("01-Evidence | 02-Case | 03-Malware | 04-Extracted Evidence")
+    info("01-Evidence | 02-Case | 03-Extracted Evidence | 04-Report")
     if IS_WINDOWS:
         try: os.startfile(os.path.abspath(case_path))
         except: pass
+
+    print()
+    if prompt("Create a Splunk index and monitor a folder for this case? (y/n):").strip().lower().startswith("y"):
+        _case_setup_splunk_monitor(name, case_path)
+
+
+def _case_setup_splunk_monitor(case_name, case_path):
+    """Create a Splunk index for a new case and optionally set up a folder monitor."""
+    try:
+        mgr = SplunkManager()
+    except Exception as exc:
+        err(f"Could not connect to Splunk: {exc}")
+        return
+
+    index_name = prompt(f"Splunk index name [Enter = '{case_name}']:").strip() or case_name
+
+    default_folder = os.path.join(case_path, "01 - Evidence", "logs")
+    folder = None
+    if prompt(f"Monitor the case's Evidence/logs folder now? (y/n) [{default_folder}]:").strip().lower().startswith("y"):
+        os.makedirs(default_folder, exist_ok=True)
+        folder = default_folder
+    elif prompt("Monitor a different folder for this index instead? (y/n):").strip().lower().startswith("y"):
+        folder = pick_folder(f"Monitor folder → index: {index_name}")
+        if not folder:
+            warn("No folder selected — index will be created without a monitor.")
+
+    ok_flag, msg = mgr.create_index_and_monitor(index_name, folder)
+    if not ok_flag:
+        err(msg)
+        return
+    ok(msg)
+    if folder:
+        ok(f"Monitoring → {folder}  (index: {index_name})")
+        mgr._open_web(index_name)
 
 def _case_archive_single(target, target_path, dst, use_pw, pw):
     """Archive a single case folder to dst. Returns True on success."""
@@ -1604,6 +1650,17 @@ class SplunkManager:
             return False, str(ve)
         except Exception as e:
             return False, f"Restore failed: {e}"
+
+    def create_index_and_monitor(self, name, folder=None):
+        """Create an index and (optionally) add a folder monitor for it.
+        Returns (ok, message). Used by both the Splunk menu and the Case Manager."""
+        ok_flag, msg = self.create_index(name)
+        if not ok_flag:
+            return False, msg
+        if folder:
+            self._add_monitor_to_inputs_conf(folder, name)
+            self._reload_monitor_inputs()
+        return True, msg
 
     # ── Submenus ──────────────────────────────────────────────────
     def _menu_create_index(self):
@@ -6885,22 +6942,48 @@ def _ts_guess_column(columns):
     return None
 
 
-def _ts_format_sample(val):
+#  Supported output formats — ISO-8601 is the default for both single-file
+#  and bulk processing.
+TS_FORMATS = {
+    "1": ("ISO-8601",           "%Y-%m-%dT%H:%M:%SZ"),
+    "2": ("DD/MM/YYYY HH:MM:SS", "%d/%m/%Y %H:%M:%S"),
+}
+TS_DEFAULT_FORMAT = TS_FORMATS["1"]
+
+
+def _ts_pick_format():
+    """Prompt the user to choose the output timestamp format. Returns (label, strftime_fmt)."""
+    print()
+    subheader("Output Timestamp Format")
+    print(f"  {_c(C.CYAN, '[1]')} ISO-8601              {_c(C.DIM, 'e.g. 2025-01-31T13:45:00Z')}  {_c(C.DIM,'(default)')}")
+    print(f"  {_c(C.CYAN, '[2]')} DD/MM/YYYY HH:MM:SS   {_c(C.DIM, 'e.g. 31/01/2025 13:45:00')}")
+    print()
+    raw = prompt(f"Select format [Enter = '{TS_DEFAULT_FORMAT[0]}']:").strip()
+    if raw == "":
+        return TS_DEFAULT_FORMAT
+    choice = TS_FORMATS.get(raw)
+    if not choice:
+        warn("Invalid selection — using default (ISO-8601).")
+        return TS_DEFAULT_FORMAT
+    return choice
+
+
+def _ts_format_sample(val, fmt=TS_DEFAULT_FORMAT[1]):
     """Try to convert a raw value to a human-readable date string for preview."""
     try:
         num = float(str(val))
         digits = len(str(int(num)))
         if digits >= 13:
-            return datetime.utcfromtimestamp(num / 1000).strftime("%d/%m/%Y %H:%M:%S") + "  (epoch ms)"
+            return datetime.utcfromtimestamp(num / 1000).strftime(fmt) + "  (epoch ms)"
         elif digits == 10:
-            return datetime.utcfromtimestamp(num).strftime("%d/%m/%Y %H:%M:%S") + "  (epoch s)"
+            return datetime.utcfromtimestamp(num).strftime(fmt) + "  (epoch s)"
     except Exception:
         pass
     return str(val)
 
 
-def _ts_convert_value(val):
-    """Convert a single timestamp value → 'DD/MM/YYYY HH:MM:SS' string or None."""
+def _ts_convert_value(val, fmt=TS_DEFAULT_FORMAT[1]):
+    """Convert a single timestamp value → formatted string or None."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
     s = str(val).strip()
@@ -6910,18 +6993,18 @@ def _ts_convert_value(val):
         if re.match(r'^\d+(\.\d+)?$', s):
             f = float(s)
             if f > 1e12:
-                return datetime.utcfromtimestamp(f / 1000).strftime("%d/%m/%Y %H:%M:%S")
+                return datetime.utcfromtimestamp(f / 1000).strftime(fmt)
             else:
-                return datetime.utcfromtimestamp(f).strftime("%d/%m/%Y %H:%M:%S")
+                return datetime.utcfromtimestamp(f).strftime(fmt)
         else:
             import pandas as _pd_local
             dt = _pd_local.to_datetime(val, utc=True)
-            return dt.strftime("%d/%m/%Y %H:%M:%S")
+            return dt.strftime(fmt)
     except Exception:
         return None
 
 
-def _ts_select_column_interactive(df):
+def _ts_select_column_interactive(df, fmt=TS_DEFAULT_FORMAT[1]):
     """Present column list, let user pick the timestamp column."""
     print()
     subheader("Column Selection")
@@ -6954,18 +7037,18 @@ def _ts_select_column_interactive(df):
     print()
     subheader(f"Sample values → '{col_name}'")
     for s in df[col_name].dropna().astype(str).head(5).tolist():
-        formatted = _ts_format_sample(s)
+        formatted = _ts_format_sample(s, fmt)
         print(f"  {_c(C.DIM, s[:40])}  →  {_c(C.GREEN, formatted)}")
 
     print()
     confirm = prompt("Proceed with this column? (y/n):").strip().lower()
     if confirm != "y":
-        return _ts_select_column_interactive(df)
+        return _ts_select_column_interactive(df, fmt)
 
     return col_name
 
 
-def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False):
+def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False, fmt=TS_DEFAULT_FORMAT[1]):
     """Read CSV, convert timestamps, save output.  Returns (lines_read, lines_written, out_path)."""
     if not _PANDAS_OK:
         err("pandas is required for this feature.  Install with:  pip install pandas")
@@ -6983,7 +7066,7 @@ def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False):
             warn(f"Could not auto-detect timestamp column in: {os.path.basename(csv_path)}")
             return lines_read, 0, None
     else:
-        col = ts_col if ts_col else _ts_select_column_interactive(df)
+        col = ts_col if ts_col else _ts_select_column_interactive(df, fmt)
         if not col:
             return lines_read, 0, None
 
@@ -6991,7 +7074,7 @@ def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False):
     total = len(df)
     converted = []
     for i, val in enumerate(df[col]):
-        converted.append(_ts_convert_value(val))
+        converted.append(_ts_convert_value(val, fmt))
         if (i + 1) % 5000 == 0 or (i + 1) == total:
             progress_bar(i + 1, total, label=f"{i+1:,} / {total:,}")
     print()
@@ -7010,7 +7093,7 @@ def _ts_process_file(csv_path, output_folder, ts_col=None, auto=False):
 
 def menu_csv_timestamp_cleaner():
     header("CSV TIMESTAMP CLEANER")
-    info("Normalise timestamps to DD/MM/YYYY HH:MM:SS — supports epoch (s/ms) and ISO-8601")
+    info("Normalise timestamps to ISO-8601 (default) or DD/MM/YYYY HH:MM:SS — supports epoch (s/ms) and ISO-8601 input")
     print()
 
     while True:
@@ -7040,9 +7123,12 @@ def menu_csv_timestamp_cleaner():
             if not out_folder:
                 warn("No output folder selected."); pause(); continue
 
+            fmt_label, fmt = _ts_pick_format()
+            ok(f"Output format: {fmt_label}")
+
             print()
             try:
-                lines_r, lines_w, out_path = _ts_process_file(csv_path, out_folder)
+                lines_r, lines_w, out_path = _ts_process_file(csv_path, out_folder, fmt=fmt)
             except Exception as exc:
                 err(f"Processing failed: {exc}"); pause(); continue
 
@@ -7050,6 +7136,7 @@ def menu_csv_timestamp_cleaner():
                 print()
                 subheader("Summary")
                 print(f"  {_c(C.DIM, 'Input file: ')} {os.path.basename(csv_path)}")
+                print(f"  {_c(C.DIM, 'Format:     ')} {fmt_label}")
                 print(f"  {_c(C.DIM, 'Lines read: ')} {lines_r:,}")
                 print(f"  {_c(C.DIM, 'Lines out:  ')} {lines_w:,}")
                 print(f"  {_c(C.DIM, 'Saved to:   ')} {out_path}")
@@ -7079,6 +7166,9 @@ def menu_csv_timestamp_cleaner():
             if not csv_files:
                 warn("No CSV files found in selected folder."); pause(); continue
 
+            fmt_label, fmt = _ts_pick_format()
+            ok(f"Output format: {fmt_label}")
+
             info(f"Found {len(csv_files)} CSV file(s). Processing with auto-detection…")
             print()
 
@@ -7086,7 +7176,7 @@ def menu_csv_timestamp_cleaner():
             for i, fp in enumerate(csv_files, 1):
                 info(f"[{i}/{len(csv_files)}] {os.path.basename(fp)}")
                 try:
-                    lr, lw, out_path = _ts_process_file(fp, out_folder, auto=True)
+                    lr, lw, out_path = _ts_process_file(fp, out_folder, auto=True, fmt=fmt)
                     total_r += lr
                     if out_path:
                         total_w += lw
@@ -7109,6 +7199,268 @@ def menu_csv_timestamp_cleaner():
 
         else:
             err("Invalid choice.")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SECTION 16 — APP SETTINGS  (Run on boot / System tray)
+#  Registry key: HKCU\\Software\\DFIRVault\\AppSettings
+#    minimize_to_tray  REG_DWORD  — hide to tray when the console is minimised
+#    close_to_tray     REG_DWORD  — best-effort: hide to tray on the [X] button
+#  Run-on-boot uses the standard HKCU Run key so Windows starts the .exe at login.
+#
+#  NOTE (Windows OS limitation): a console app cannot truly cancel a
+#  CTRL_CLOSE_EVENT (clicking the [X] button) — Windows force-terminates the
+#  process a few seconds after the handler returns regardless of the return
+#  value. "Close to tray" hides the window and starts the tray icon
+#  immediately so it *feels* instant, but on some systems the process may
+#  still be killed a moment later. "Minimize to tray" (using the normal
+#  minimize button) is fully reliable and is the recommended option.
+# ══════════════════════════════════════════════════════════════════
+
+APPSETTINGS_SECTION = "AppSettings"
+RUN_KEY_PATH         = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_KEY_VALUE_NAME    = "DFIRVault"
+
+SW_HIDE    = 0
+SW_SHOW    = 5
+SW_RESTORE = 9
+
+_tray_icon_obj        = None
+_tray_lock            = threading.Lock()
+_console_ctrl_handler_ref = None   # must stay referenced or the callback gets GC'd
+
+
+def _app_settings_get(key, default=False):
+    val = RegistryConfig.load_config(APPSETTINGS_SECTION, key, None)
+    if val is None:
+        return default
+    return bool(val)
+
+
+def _app_settings_set(key, value):
+    RegistryConfig.save_config(APPSETTINGS_SECTION, key, bool(value))
+
+
+def _run_on_boot_target():
+    """Command line Windows should launch at login."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def is_run_on_boot_enabled():
+    if not IS_WINDOWS:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, RUN_KEY_VALUE_NAME)
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+
+def set_run_on_boot(enabled):
+    if not IS_WINDOWS:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            winreg.SetValueEx(key, RUN_KEY_VALUE_NAME, 0, winreg.REG_SZ, _run_on_boot_target())
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_KEY_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        err(f"Could not update startup registry key: {e}")
+        return False
+
+
+def _console_hwnd():
+    try:
+        return ctypes.windll.kernel32.GetConsoleWindow()
+    except Exception:
+        return 0
+
+
+def _console_hide():
+    hwnd = _console_hwnd()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+
+
+def _console_show():
+    hwnd = _console_hwnd()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+
+def _tray_make_icon_image():
+    """Self-contained fallback icon (no bundled asset required)."""
+    img = _TrayImage.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = _TrayImageDraw.Draw(img)
+    d.rounded_rectangle([2, 2, 61, 61], radius=12, fill=(0, 188, 212, 255))
+    d.text((13, 20), "DV", fill=(10, 14, 18, 255))
+    return img
+
+
+def _tray_load_icon_image():
+    """Use a bundled icon.ico if present next to the exe/script, else generate one."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(sys._MEIPASS, "icon.ico"))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "icon.ico"))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico"))
+    for c in candidates:
+        try:
+            if os.path.exists(c):
+                return _TrayImage.open(c)
+        except Exception:
+            pass
+    return _tray_make_icon_image()
+
+
+def _tray_on_open(icon, item):
+    _console_show()
+    _tray_stop()
+
+
+def _tray_on_exit(icon, item):
+    _tray_stop()
+    os._exit(0)
+
+
+def _tray_stop():
+    global _tray_icon_obj
+    with _tray_lock:
+        if _tray_icon_obj:
+            try:
+                _tray_icon_obj.stop()
+            except Exception:
+                pass
+            _tray_icon_obj = None
+
+
+def _tray_start(tooltip="DFIRVault — DFIR Operations Console"):
+    """Hide the console window and show a system tray icon. Returns True if started."""
+    global _tray_icon_obj
+    if not IS_WINDOWS:
+        return False
+    if not _TRAY_OK:
+        warn("Tray support unavailable — install with:  pip install pystray pillow")
+        return False
+    with _tray_lock:
+        if _tray_icon_obj:
+            return True
+        image = _tray_load_icon_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("Open DFIRVault", _tray_on_open, default=True),
+            pystray.MenuItem("Exit", _tray_on_exit),
+        )
+        _tray_icon_obj = pystray.Icon("DFIRVault", image, tooltip, menu)
+        threading.Thread(target=_tray_icon_obj.run, daemon=True).start()
+    _console_hide()
+    return True
+
+
+def _minimize_watcher_loop():
+    """Background daemon: if 'minimize to tray' is enabled, watch for the
+    console being minimised and swap it for a tray icon."""
+    while True:
+        time.sleep(0.6)
+        try:
+            if not _app_settings_get("minimize_to_tray", False):
+                continue
+            hwnd = _console_hwnd()
+            if hwnd and ctypes.windll.user32.IsIconic(hwnd) and _tray_icon_obj is None:
+                _tray_start()
+        except Exception:
+            pass
+
+
+def _console_ctrl_handler(ctrl_type):
+    """Best-effort close-to-tray. See the OS-limitation note above the section header."""
+    CTRL_C_EVENT, CTRL_CLOSE_EVENT = 0, 2
+    if ctrl_type in (CTRL_C_EVENT, CTRL_CLOSE_EVENT):
+        if _app_settings_get("close_to_tray", False):
+            _tray_start()
+            return True
+    return False
+
+
+def install_close_handler():
+    global _console_ctrl_handler_ref
+    if not IS_WINDOWS:
+        return
+    handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+    _console_ctrl_handler_ref = handler_type(_console_ctrl_handler)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
+
+
+def start_tray_background_services():
+    """Call once at startup to enable whichever tray features are configured."""
+    if not IS_WINDOWS:
+        return
+    if _app_settings_get("close_to_tray", False):
+        install_close_handler()
+    threading.Thread(target=_minimize_watcher_loop, daemon=True).start()
+
+
+def menu_app_settings():
+    while True:
+        header("APP SETTINGS")
+        boot_on    = is_run_on_boot_enabled()
+        min_tray   = _app_settings_get("minimize_to_tray", False)
+        close_tray = _app_settings_get("close_to_tray", False)
+        frozen     = getattr(sys, "frozen", False)
+
+        print()
+        print(f"  {_c(C.DIM,'Run on boot:      ')} " + (_c(C.GREEN,'Enabled') if boot_on else _c(C.DIM,'Disabled')))
+        print(f"  {_c(C.DIM,'Minimize to tray: ')} " + (_c(C.GREEN,'Enabled') if min_tray else _c(C.DIM,'Disabled')))
+        print(f"  {_c(C.DIM,'Close to tray:    ')} " + (_c(C.GREEN,'Enabled') if close_tray else _c(C.DIM,'Disabled')) + f"  {_c(C.DIM,'(best effort)')}")
+        print()
+        if not _TRAY_OK:
+            warn("pystray / Pillow not installed — tray features will not work.")
+            info("Install with:  pip install pystray pillow")
+        if not frozen:
+            warn("Running from source — 'Run on boot' will launch via python.exe, not a compiled .exe.")
+
+        print()
+        print(f"  {_c(C.CYAN,'[1]')} Toggle Run on Boot")
+        print(f"  {_c(C.CYAN,'[2]')} Toggle Minimize to Tray")
+        print(f"  {_c(C.CYAN,'[3]')} Toggle Close to Tray  {_c(C.DIM,'(best effort — see note)')}")
+        print(f"  {_c(C.CYAN,'[4]')} Minimize to tray now")
+        print(f"  {_c(C.RED, '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+
+        if ch == "1":
+            if set_run_on_boot(not boot_on):
+                ok("Run on boot enabled." if not boot_on else "Run on boot disabled.")
+        elif ch == "2":
+            _app_settings_set("minimize_to_tray", not min_tray)
+            ok("Minimize to tray enabled." if not min_tray else "Minimize to tray disabled.")
+            if not min_tray and not _TRAY_OK:
+                warn("Install pystray + pillow for this to work:  pip install pystray pillow")
+        elif ch == "3":
+            _app_settings_set("close_to_tray", not close_tray)
+            ok("Close to tray enabled." if not close_tray else "Close to tray disabled.")
+            if not close_tray:
+                install_close_handler()
+                info("Windows may still force-close the process a few seconds after clicking [X] — this is an OS limitation, not a bug.")
+        elif ch == "4":
+            if _tray_start():
+                ok("Minimized to tray. Use the tray icon to reopen or exit.")
+        elif ch == "0":
+            break
+        else:
+            err("Invalid choice.")
+        pause()
 
 
 BANNER = f"""
@@ -8429,7 +8781,8 @@ def main():
     if not IS_WINDOWS:
         err("This tool is designed for Windows systems only.")
         sys.exit(1)
-    
+
+    start_tray_background_services()
     check_for_updates()
     clear_screen()
     print(BANNER)
@@ -8460,7 +8813,7 @@ def main():
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── CSV UTILITIES ──────────────────────────')}")
         print(f"  {_c(C.CYAN,'[11]')} CSV Splitter        {_c(C.DIM,'split large CSVs by size or line count')}")
-        print(f"  {_c(C.CYAN,'[12]')} CSV Timestamp Cleaner  {_c(C.DIM,'normalise timestamps to DD/MM/YYYY HH:MM:SS')}")
+        print(f"  {_c(C.CYAN,'[12]')} CSV Timestamp Cleaner  {_c(C.DIM,'normalise timestamps to ISO-8601 or DD/MM/YYYY HH:MM:SS')}")
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── DISK IMAGES ─────────────────────────────')}")
         print(f"  {_c(C.CYAN,'[13]')} Disk Image Converter  {_c(C.DIM,'qemu-img batch convert (raw/qcow2/vmdk/vhdx/...)')}")
@@ -8470,6 +8823,9 @@ def main():
         print()
         print(f"  {_c(C.BOLD+C.WHITE, '─── DATA CONVERSION ─────────────────────────')}")
         print(f"  {_c(C.CYAN,'[15]')} JSON ⇄ CSV Converter  {_c(C.DIM,'convert a file or folder between JSON and CSV')}")
+        print()
+        print(f"  {_c(C.BOLD+C.WHITE, '─── APPLICATION ─────────────────────────────')}")
+        print(f"  {_c(C.CYAN,'[16]')} App Settings  {_c(C.DIM,'run on boot / minimize & close to system tray')}")
         print()
         print(f"  {_c(C.RED,'[0]')} Exit")
         print()
@@ -8492,10 +8848,11 @@ def main():
         elif choice == "13": clear_screen(); menu_disk_image_converter()
         elif choice == "14": clear_screen(); menu_volatility()
         elif choice == "15": clear_screen(); menu_json_csv_converter()
+        elif choice == "16": clear_screen(); menu_app_settings()
         elif choice == "0":
             print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
         else:
-            err("Invalid choice. Enter 1-15 or 0.")
+            err("Invalid choice. Enter 1-16 or 0.")
         clear_screen()
         print(BANNER)
 
