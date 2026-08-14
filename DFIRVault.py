@@ -44,6 +44,7 @@ import sqlite3
 import threading
 import subprocess
 import webbrowser
+import queue
 from pathlib import Path
 from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -51,7 +52,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.7"
+CURRENT_VERSION  = "v0.6.8"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -220,6 +221,300 @@ class RegistryConfig:
 
 
 # ──────────────────────────────────────────────────────────────────
+# GUI TERMINAL BRIDGE
+#
+# DFIRVault normally runs as a real Windows console app. A console can
+# never truly veto its own close ([X] button) — Windows force-terminates
+# the process a few seconds after CTRL_CLOSE_EVENT regardless of what the
+# handler returns. That's a hard OS limitation, not a bug.
+#
+# When compiled with PyInstaller's --windowed flag there is NO console at
+# all, so at startup we detect that and stand up a Tk-based terminal
+# window instead. A real Tk window's WM_DELETE_WINDOW *can* be vetoed, so
+# "close to tray" becomes fully reliable in that build — at the cost of
+# every Tkinter call in the app needing to run on one single GUI thread.
+#
+# DFIRVault already opens ~15 separate ad-hoc tk.Tk() dialogs across
+# Splunk, SFTP, the Bodyfile Explorer and the disk-image converter, most
+# of them deep inside worker-thread business logic. run_on_gui_thread()
+# below is a small blocking bridge: any Tkinter-touching function can be
+# wrapped with @gui_marshaled and it will transparently execute on the
+# GUI thread (with its own nested mainloop() if it has one — Tk supports
+# that fine) while the calling thread blocks for the result.
+#
+# In the classic console build none of this activates — GUI_TERMINAL_MODE
+# stays False and every @gui_marshaled function just calls straight
+# through on whatever thread called it, identical to today's behaviour.
+# ──────────────────────────────────────────────────────────────────
+
+GUI_TERMINAL_MODE  = False   # flipped True only in windowed (--windowed) builds
+_gui_terminal      = None    # the _GuiTerminal singleton, once running
+_gui_thread_ident  = None
+_gui_request_q     = queue.Queue()   # (func, args, kwargs, result_q) -> GUI thread
+
+
+def _has_real_console():
+    """True if this process owns a real Windows console (classic build)."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        return ctypes.windll.kernel32.GetConsoleWindow() != 0
+    except Exception:
+        return True
+
+
+def run_on_gui_thread(func, *args, **kwargs):
+    """Run func(*args, **kwargs) on the Tk GUI thread and block the caller
+    for its result. Outside GUI-terminal mode (or if already on the GUI
+    thread) this is just func(*args, **kwargs) — no behaviour change."""
+    if not GUI_TERMINAL_MODE or threading.current_thread().ident == _gui_thread_ident:
+        return func(*args, **kwargs)
+    result_q = queue.Queue(maxsize=1)
+    _gui_request_q.put((func, args, kwargs, result_q))
+    outcome, value = result_q.get()
+    if outcome == "error":
+        raise value
+    return value
+
+
+def gui_marshaled(func):
+    """Decorator for any function that touches Tkinter (tk.Tk(), filedialog,
+    messagebox, ttk widgets, its own mainloop() ...). Safe to leave applied
+    in the classic console build — it's a no-op passthrough there."""
+    def _wrapper(*args, **kwargs):
+        return run_on_gui_thread(func, *args, **kwargs)
+    _wrapper.__name__ = getattr(func, "__name__", "gui_marshaled_fn")
+    return _wrapper
+
+
+def _drain_gui_requests():
+    """Pop and execute any pending marshaled calls. Must only be invoked
+    from the GUI thread (the _GuiTerminal pump loop does this)."""
+    try:
+        while True:
+            func, args, kwargs, result_q = _gui_request_q.get_nowait()
+            try:
+                result_q.put(("ok", func(*args, **kwargs)))
+            except Exception as e:
+                result_q.put(("error", e))
+    except queue.Empty:
+        pass
+
+
+class _GuiTerminal:
+    """Minimal Tk-based terminal emulator standing in for the real Windows
+    console in --windowed builds. Renders the same ANSI-coloured text this
+    app already prints, accepts typed input on the last line, and — unlike
+    a console — gives us a real, cancellable close event."""
+
+    ANSI_COLOURS = {
+        "30": "#585b70", "31": "#f38ba8", "32": "#a6e3a1", "33": "#f9e2af",
+        "34": "#89b4fa", "35": "#cba6f7", "36": "#94e2d5", "37": "#cdd6f4",
+        "90": "#6c7086", "91": "#f38ba8", "92": "#a6e3a1", "93": "#f9e2af",
+        "94": "#89b4fa", "95": "#cba6f7", "96": "#94e2d5", "97": "#ffffff",
+    }
+    ANSI_RE = re.compile(r'\x1b\[(\d+(?:;\d+)*)m')
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(f"DFIRVault {CURRENT_VERSION}  —  DFIR Operations Console")
+        self.root.geometry("1040x660")
+        self.root.configure(bg="#11131a")
+
+        self.text = tk.Text(
+            self.root, bg="#11131a", fg="#cdd6f4", insertbackground="#cdd6f4",
+            font=("Consolas", 11), wrap="word", undo=False,
+            borderwidth=0, highlightthickness=0, padx=10, pady=8,
+        )
+        self.text.pack(fill="both", expand=True)
+        self.text.config(state="disabled")
+
+        for code, colour in self.ANSI_COLOURS.items():
+            self.text.tag_configure(f"c{code}", foreground=colour)
+        self.text.tag_configure("bold", font=("Consolas", 11, "bold"))
+        self.text.tag_configure("dim", foreground="#6c7086")
+
+        self._active_tags = set()
+        self._mark = "input_start"
+        self.text.mark_set(self._mark, "end-1c")
+        self.text.mark_gravity(self._mark, "left")
+
+        self._input_pending = None     # queue.Queue the worker thread is blocked on
+        self._input_mask    = False
+        self._masked_buffer = ""
+
+        self.text.bind("<Key>", self._on_key)
+        self.text.bind("<Return>", self._on_return)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.root.bind("<Unmap>", self._on_unmap)
+
+        self.root.after(15, self._pump)
+
+    # ---- stdout / stderr interface -------------------------------
+    def write(self, s):
+        if s:
+            self.root.after(0, self._append, s)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+    # ---- rendering --------------------------------------------------
+    def _append(self, s):
+        self.text.config(state="normal")
+        for chunk in re.split(r'(\r)', s):
+            if chunk == "\r":
+                self.text.delete("end-1c linestart", "end-1c")
+                continue
+            self._append_ansi(chunk)
+        self.text.mark_set(self._mark, "end-1c")
+        self.text.see("end")
+        self.text.config(state="disabled")
+
+    def _append_ansi(self, s):
+        pos = 0
+        for m in self.ANSI_RE.finditer(s):
+            if m.start() > pos:
+                self.text.insert("end", s[pos:m.start()], tuple(self._active_tags))
+            for code in m.group(1).split(";"):
+                if code == "0":
+                    self._active_tags = set()
+                elif code == "1":
+                    self._active_tags.add("bold")
+                elif code == "2":
+                    self._active_tags.add("dim")
+                elif code in self.ANSI_COLOURS:
+                    self._active_tags = {t for t in self._active_tags if not t.startswith("c")} | {f"c{code}"}
+            pos = m.end()
+        if pos < len(s):
+            self.text.insert("end", s[pos:], tuple(self._active_tags))
+
+    def clear(self):
+        self.root.after(0, self._clear)
+
+    def _clear(self):
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.config(state="disabled")
+        self.text.mark_set(self._mark, "end-1c")
+
+    # ---- input() / getpass.getpass() replacement ---------------------
+    def readline(self, mask=False):
+        """Block the calling (worker) thread until Enter is pressed in the
+        window. Returns the typed line, no trailing newline."""
+        q = queue.Queue(maxsize=1)
+        self.root.after(0, self._begin_input, q, mask)
+        return q.get()
+
+    def _begin_input(self, q, mask):
+        self._input_pending = q
+        self._input_mask = mask
+        self._masked_buffer = ""
+        self.text.config(state="normal")
+        self.text.mark_set(self._mark, "end-1c")
+        self.text.mark_set("insert", "end")
+        self.text.see("end")
+        self.text.focus_set()
+
+    def _on_key(self, event):
+        if self._input_pending is None:
+            return "break"
+        if self.text.compare("insert", "<", self._mark):
+            self.text.mark_set("insert", "end")
+        if self._input_mask and event.char and event.char.isprintable():
+            self._masked_buffer += event.char
+            self.text.insert("end", "*")
+            return "break"
+        if event.keysym == "BackSpace" and self._input_mask:
+            self._masked_buffer = self._masked_buffer[:-1]
+        return None
+
+    def _on_return(self, event):
+        if self._input_pending is None:
+            return "break"
+        line = self._masked_buffer if self._input_mask else self.text.get(self._mark, "end-1c")
+        self.text.insert("end", "\n")
+        self.text.mark_set(self._mark, "end-1c")
+        self.text.config(state="disabled")
+        q, self._input_pending = self._input_pending, None
+        q.put(line)
+        return "break"
+
+    # ---- window / tray handling ----------------------------------
+    def _on_unmap(self, event):
+        if event.widget is self.root and self.root.state() == "iconic":
+            if _app_settings_get("minimize_to_tray", False):
+                self.hide_to_tray()
+
+    def hide_to_tray(self):
+        _tray_start()
+
+    def hide(self):
+        self.root.withdraw()
+
+    def show(self):
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _pump(self):
+        _drain_gui_requests()
+        self.root.after(15, self._pump)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def _gui_input(prompt_text=""):
+    if prompt_text:
+        _gui_terminal.write(prompt_text)
+    return _gui_terminal.readline(mask=False)
+
+
+def _gui_getpass(prompt_text="Password: "):
+    if prompt_text:
+        _gui_terminal.write(prompt_text)
+    return _gui_terminal.readline(mask=True)
+
+
+def bootstrap_gui_terminal():
+    """Entry point used instead of main() when no real console is attached
+    (--windowed builds). Spins up the Tk terminal on this (the main)
+    thread, redirects stdout/stderr/input/getpass to it, and runs the rest
+    of the application on a background worker thread."""
+    global GUI_TERMINAL_MODE, _gui_terminal, _gui_thread_ident
+    GUI_TERMINAL_MODE = True
+    _gui_terminal = _GuiTerminal()
+    _gui_thread_ident = threading.current_thread().ident
+
+    sys.stdout = _gui_terminal
+    sys.stderr = _gui_terminal
+    import builtins
+    builtins.input = _gui_input
+    getpass.getpass = _gui_getpass
+
+    def _worker():
+        try:
+            main()
+        except SystemExit:
+            pass
+        except Exception as exc:
+            try:
+                _gui_terminal.write(f"\n\nFATAL ERROR: {exc}\n")
+            except Exception:
+                pass
+        finally:
+            os._exit(0)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    _gui_terminal.run()   # blocks this thread in Tk's mainloop until exit
+
+
+# ──────────────────────────────────────────────────────────────────
 # AUTO-UPDATE SYSTEM
 # Checks GitHub Releases API on startup and self-replaces the .exe
 # Registry key: HKCU\Software\DFIRVault\AutoUpdate
@@ -257,6 +552,7 @@ def _upd_newer(remote_tag: str, local_tag: str) -> bool:
     return _upd_parse_version(remote_tag) > _upd_parse_version(local_tag)
 
 
+@gui_marshaled
 def _upd_show_error_dialog(message: str):
     """Show a tkinter error popup."""
     try:
@@ -566,7 +862,10 @@ def divider(width=64):
     print(_c(C.DIM, C.LIGHT * width))
 
 def clear_screen():
-    os.system("cls" if IS_WINDOWS else "clear")
+    if GUI_TERMINAL_MODE and _gui_terminal:
+        _gui_terminal.clear()
+    else:
+        os.system("cls" if IS_WINDOWS else "clear")
 
 def spinner(message, duration=2.0):
     end = time.time() + duration
@@ -586,18 +885,42 @@ def progress_bar(current, total, width=40, label=""):
 def pause(msg="Press Enter to continue..."):
     input(f"\n  {_c(C.DIM, msg)}")
 
+@gui_marshaled
 def pick_folder(title="Select Folder"):
     root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
     p = filedialog.askdirectory(title=title); root.destroy(); return p
 
+@gui_marshaled
 def pick_file(title="Select File", filetypes=None):
     root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
     kw = {"filetypes": filetypes} if filetypes else {}
     p = filedialog.askopenfilename(title=title, **kw); root.destroy(); return p
 
+@gui_marshaled
+def pick_files(title="Select Files", filetypes=None):
+    """Multi-file open dialog. Returns a tuple of paths (empty if cancelled)."""
+    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+    kw = {"filetypes": filetypes} if filetypes else {}
+    p = filedialog.askopenfilenames(title=title, **kw); root.destroy(); return p
+
+@gui_marshaled
+def pick_save_file(title="Save File", defaultextension=None, filetypes=None, initialfile=None):
+    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+    kw = {}
+    if defaultextension: kw["defaultextension"] = defaultextension
+    if filetypes: kw["filetypes"] = filetypes
+    if initialfile: kw["initialfile"] = initialfile
+    p = filedialog.asksaveasfilename(title=title, **kw); root.destroy(); return p
+
+@gui_marshaled
 def yesno_dialog(title, message):
     root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
     r = messagebox.askyesno(title, message); root.destroy(); return r
+
+@gui_marshaled
+def info_dialog(title, message):
+    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+    messagebox.showinfo(title, message); root.destroy()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1360,14 +1683,12 @@ class SplunkManager:
         RegistryConfig.save_config("Splunk", "password", self.password)
 
     def _pick_splunk_path(self):
-        root = tk.Tk(); root.withdraw()
         for p in DEFAULT_SPLUNK_PATHS:
             if os.path.exists(p):
-                if messagebox.askyesno("Splunk Found", f"Use Splunk at:\n{p}?"):
-                    self.splunk_path = p; root.destroy(); return
-        messagebox.showinfo("Splunk Path", "Select the Splunk binary.")
-        self.splunk_path = filedialog.askopenfilename(title="Select Splunk binary")
-        root.destroy()
+                if yesno_dialog("Splunk Found", f"Use Splunk at:\n{p}?"):
+                    self.splunk_path = p; return
+        info_dialog("Splunk Path", "Select the Splunk binary.")
+        self.splunk_path = pick_file(title="Select Splunk binary")
 
     def _pick_creds(self):
         print()
@@ -1464,10 +1785,8 @@ class SplunkManager:
     def _remove_from_indexes_conf(self, name):
         conf = self._conf_path("indexes.conf")
         if not conf:
-            root = tk.Tk(); root.withdraw()
-            messagebox.showinfo("indexes.conf", "Could not auto-locate indexes.conf.")
-            conf = filedialog.askopenfilename(title="Select indexes.conf", filetypes=[("Config","*.conf")])
-            root.destroy()
+            info_dialog("indexes.conf", "Could not auto-locate indexes.conf.")
+            conf = pick_file(title="Select indexes.conf", filetypes=[("Config", "*.conf")])
             if not conf: return False
         try:
             content = open(conf).read()
@@ -1485,10 +1804,8 @@ class SplunkManager:
         spinner(f"Updating indexes.conf for '{name}'…", 1)
         conf = self._conf_path("indexes.conf")
         if not conf:
-            root = tk.Tk(); root.withdraw()
-            messagebox.showinfo("indexes.conf","Could not auto-locate indexes.conf.")
-            conf = filedialog.askopenfilename(title="Select indexes.conf",filetypes=[("Config","*.conf")])
-            root.destroy()
+            info_dialog("indexes.conf", "Could not auto-locate indexes.conf.")
+            conf = pick_file(title="Select indexes.conf", filetypes=[("Config", "*.conf")])
             if not conf: return False
         block = (f"\n[{name}]\ncoldPath = $SPLUNK_DB\\{name}\\colddb\n"
                  f"enableDataIntegrityControl = 0\nenableTsidxReduction = 0\n"
@@ -2656,6 +2973,7 @@ class _FTPClient:
             err(f"Upload failed: {e}"); logger.error(f"UPLOAD FAILED: {e}"); return False
 
 
+@gui_marshaled
 def _sftp_select_remote_folder(client):
     root = tk.Tk()
     root.title("Select Remote Folder")
@@ -4610,6 +4928,7 @@ def bf_get_available_port(start_port=8000, max_port=8100):
             continue
     raise Exception(f"No available ports found between {start_port} and {max_port}")
 
+@gui_marshaled
 def bf_ask_date_range_filter():
     """Ask user if they want to apply date range filtering"""
     root = tk.Tk()
@@ -6371,14 +6690,11 @@ def bf_start_server(db_path, port=8000):
                 try:
                     os.remove(flag_file)
                     print("\n📁 Add Bodyfile request detected...")
-                    root = tk.Tk()
-                    root.withdraw()
-                    
-                    bodyfile_paths = filedialog.askopenfilenames(
+                    bodyfile_paths = pick_files(
                         title="Select Additional Bodyfile(s)",
                         filetypes=[("Bodyfile", "*.txt *.body *.log"), ("All files", "*.*")]
                     )
-                    
+
                     if bodyfile_paths:
                         for bodyfile_path in bodyfile_paths:
                             print(f"→ Adding bodyfile: {bodyfile_path}")
@@ -6394,8 +6710,7 @@ def bf_start_server(db_path, port=8000):
                             print(f"⚠️  Could not update HTML: {e}")
                     else:
                         print("❌ No bodyfile selected")
-                        
-                    root.destroy()
+
                 except Exception as e:
                     print(f"❌ Error adding bodyfile: {e}")
     
@@ -6412,6 +6727,7 @@ def bf_start_server(db_path, port=8000):
 # Initial Setup Dialog
 # -------------------------------------------------------------------
 
+@gui_marshaled
 def bf_show_initial_dialog():
     """Show initial dialog to open existing or create new database"""
     root = tk.Tk()
@@ -6592,15 +6908,12 @@ def menu_bodyfile_explorer():
         if ch == "1":
             clear_screen()
             header("NEW BODYFILE ANALYSIS")
-            root = tk.Tk()
-            root.withdraw()
 
             info("Select input bodyfile(s)...")
-            bodyfile_paths = filedialog.askopenfilenames(
+            bodyfile_paths = pick_files(
                 title="Select Bodyfile (v2/v3)",
                 filetypes=[("Bodyfile", "*.txt *.body *.log"), ("All files", "*.*")]
             )
-            root.destroy()
             if not bodyfile_paths:
                 warn("No input file selected.")
                 pause()
@@ -6608,15 +6921,12 @@ def menu_bodyfile_explorer():
 
             ok(f"Selected {len(bodyfile_paths)} bodyfile(s)")
 
-            root2 = tk.Tk()
-            root2.withdraw()
             info("Choose output CSV location...")
-            output_csv = filedialog.asksaveasfilename(
+            output_csv = pick_save_file(
                 title="Save CSV As",
                 defaultextension=".csv",
                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
             )
-            root2.destroy()
             if not output_csv:
                 warn("No output file selected.")
                 pause()
@@ -6650,13 +6960,10 @@ def menu_bodyfile_explorer():
         elif ch == "2":
             clear_screen()
             header("OPEN EXISTING DATABASE")
-            root = tk.Tk()
-            root.withdraw()
-            db_file = filedialog.askopenfilename(
+            db_file = pick_file(
                 title="Select Existing Database",
                 filetypes=[("Database files", "*.db"), ("All files", "*.*")]
             )
-            root.destroy()
             if not db_file:
                 warn("No file selected.")
                 pause()
@@ -7326,7 +7633,10 @@ def _tray_load_icon_image():
 
 
 def _tray_on_open(icon, item):
-    _console_show()
+    if GUI_TERMINAL_MODE and _gui_terminal:
+        run_on_gui_thread(_gui_terminal.show)
+    else:
+        _console_show()
     _tray_stop()
 
 
@@ -7347,7 +7657,7 @@ def _tray_stop():
 
 
 def _tray_start(tooltip="DFIRVault — DFIR Operations Console"):
-    """Hide the console window and show a system tray icon. Returns True if started."""
+    """Hide the console/window and show a system tray icon. Returns True if started."""
     global _tray_icon_obj
     if not IS_WINDOWS:
         return False
@@ -7364,16 +7674,23 @@ def _tray_start(tooltip="DFIRVault — DFIR Operations Console"):
         )
         _tray_icon_obj = pystray.Icon("DFIRVault", image, tooltip, menu)
         threading.Thread(target=_tray_icon_obj.run, daemon=True).start()
-    _console_hide()
+    if GUI_TERMINAL_MODE and _gui_terminal:
+        run_on_gui_thread(_gui_terminal.hide)
+    else:
+        _console_hide()
     return True
 
 
 def _minimize_watcher_loop():
-    """Background daemon: if 'minimize to tray' is enabled, watch for the
-    console being minimised and swap it for a tray icon."""
+    """Background daemon (classic console build only): if 'minimize to tray'
+    is enabled, watch for the console being minimised and swap it for a tray
+    icon. In GUI-terminal mode this is unnecessary — _GuiTerminal already
+    handles minimize/close directly via real Tk window events."""
     while True:
         time.sleep(0.6)
         try:
+            if GUI_TERMINAL_MODE:
+                return
             if not _app_settings_get("minimize_to_tray", False):
                 continue
             hwnd = _console_hwnd()
@@ -7384,7 +7701,9 @@ def _minimize_watcher_loop():
 
 
 def _console_ctrl_handler(ctrl_type):
-    """Best-effort close-to-tray. See the OS-limitation note above the section header."""
+    """Best-effort close-to-tray for the classic console build. See the
+    OS-limitation note above the section header. Not used in GUI-terminal
+    mode, where WM_DELETE_WINDOW gives a fully reliable close instead."""
     CTRL_C_EVENT, CTRL_CLOSE_EVENT = 0, 2
     if ctrl_type in (CTRL_C_EVENT, CTRL_CLOSE_EVENT):
         if _app_settings_get("close_to_tray", False):
@@ -7395,7 +7714,7 @@ def _console_ctrl_handler(ctrl_type):
 
 def install_close_handler():
     global _console_ctrl_handler_ref
-    if not IS_WINDOWS:
+    if not IS_WINDOWS or GUI_TERMINAL_MODE:
         return
     handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
     _console_ctrl_handler_ref = handler_type(_console_ctrl_handler)
@@ -7403,8 +7722,11 @@ def install_close_handler():
 
 
 def start_tray_background_services():
-    """Call once at startup to enable whichever tray features are configured."""
-    if not IS_WINDOWS:
+    """Call once at startup to enable whichever tray features are configured.
+    No-op in GUI-terminal mode — _GuiTerminal.__init__ already wires
+    WM_DELETE_WINDOW (close) and <Unmap> (minimize) directly on the real
+    Tk window, which is simpler and fully reliable there."""
+    if not IS_WINDOWS or GUI_TERMINAL_MODE:
         return
     if _app_settings_get("close_to_tray", False):
         install_close_handler()
@@ -7418,22 +7740,26 @@ def menu_app_settings():
         min_tray   = _app_settings_get("minimize_to_tray", False)
         close_tray = _app_settings_get("close_to_tray", False)
         frozen     = getattr(sys, "frozen", False)
+        close_note = "fully reliable — GUI window" if GUI_TERMINAL_MODE else "best effort — console window"
 
         print()
+        print(f"  {_c(C.DIM,'Build mode:       ')} " + (_c(C.CYAN,'GUI terminal (--windowed build)') if GUI_TERMINAL_MODE else _c(C.CYAN,'Classic console build')))
         print(f"  {_c(C.DIM,'Run on boot:      ')} " + (_c(C.GREEN,'Enabled') if boot_on else _c(C.DIM,'Disabled')))
         print(f"  {_c(C.DIM,'Minimize to tray: ')} " + (_c(C.GREEN,'Enabled') if min_tray else _c(C.DIM,'Disabled')))
-        print(f"  {_c(C.DIM,'Close to tray:    ')} " + (_c(C.GREEN,'Enabled') if close_tray else _c(C.DIM,'Disabled')) + f"  {_c(C.DIM,'(best effort)')}")
+        print(f"  {_c(C.DIM,'Close to tray:    ')} " + (_c(C.GREEN,'Enabled') if close_tray else _c(C.DIM,'Disabled')) + f"  {_c(C.DIM, '(' + close_note + ')')}")
         print()
         if not _TRAY_OK:
             warn("pystray / Pillow not installed — tray features will not work.")
             info("Install with:  pip install pystray pillow")
         if not frozen:
             warn("Running from source — 'Run on boot' will launch via python.exe, not a compiled .exe.")
+        if not GUI_TERMINAL_MODE:
+            info("Build with PyInstaller's --windowed flag for fully reliable close-to-tray (see docs).")
 
         print()
         print(f"  {_c(C.CYAN,'[1]')} Toggle Run on Boot")
         print(f"  {_c(C.CYAN,'[2]')} Toggle Minimize to Tray")
-        print(f"  {_c(C.CYAN,'[3]')} Toggle Close to Tray  {_c(C.DIM,'(best effort — see note)')}")
+        print(f"  {_c(C.CYAN,'[3]')} Toggle Close to Tray  {_c(C.DIM, '(' + close_note + ')')}")
         print(f"  {_c(C.CYAN,'[4]')} Minimize to tray now")
         print(f"  {_c(C.RED, '[0]')} Back")
         divider()
@@ -7576,6 +7902,7 @@ def _qimg_likely_formats_for_extension(path):
     return [fmt for fmt, exts in _QIMG_FORMAT_EXTENSIONS.items() if ext in exts]
 
 
+@gui_marshaled
 def _qimg_resolve_binary():
     """
     Resolve the path to qemu-img.exe using the registry
@@ -7596,18 +7923,16 @@ def _qimg_resolve_binary():
     while True:
         if _LE_IMPORTS_OK:
             pass  # no-op, just keeping flake-friendly
-        root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
-        messagebox.showinfo(
+        info_dialog(
             "qemu-img location required",
             "qemu-img.exe could not be located.\n\n"
             "Please select the qemu-img.exe file (usually inside your "
             "QEMU installation directory, e.g. C:\\Program Files\\qemu)."
         )
-        chosen = filedialog.askopenfilename(
+        chosen = pick_file(
             title="Select qemu-img.exe",
             filetypes=[("qemu-img executable", "qemu-img.exe"), ("All files", "*.*")],
         )
-        root.destroy()
 
         if not chosen:
             url = "https://cloudbase.it/qemu-img-windows/"
@@ -7618,9 +7943,7 @@ def _qimg_resolve_binary():
                 "then return to this menu and try again, selecting "
                 "qemu-img.exe from the unzipped folder."
             )
-            root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
-            messagebox.showinfo("Download qemu-img for Windows", msg)
-            root.destroy()
+            info_dialog("Download qemu-img for Windows", msg)
             webbrowser.open(url)
             return None
 
@@ -7644,14 +7967,11 @@ def _qimg_resolve_binary():
 def _qimg_pick_output_path(default_name, dst_format):
     ext = _QIMG_FORMAT_EXTENSIONS.get(dst_format, [".img"])[0]
     suggested = os.path.splitext(default_name)[0] + ext
-
-    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
-    filepath = filedialog.asksaveasfilename(
+    filepath = pick_save_file(
         title="Save converted image as",
         initialfile=suggested,
         defaultextension=ext,
     )
-    root.destroy()
     return filepath or None
 
 
@@ -8865,6 +9185,10 @@ if __name__ == "__main__":
             exec(compile(code, script, "exec"), {
                 "os": os, "json": json, "shutil": shutil, "Path": Path, "__name__": "__main__"
             })
+    elif IS_WINDOWS and not _has_real_console():
+        # No console attached — this is a --windowed PyInstaller build.
+        # Stand up the Tk terminal emulator instead of a real console.
+        bootstrap_gui_terminal()
     else:
         try:
             main()
