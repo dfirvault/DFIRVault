@@ -632,7 +632,14 @@ echo [*] Killing existing DFIRVault processes...
 taskkill /F /IM "{exe_filename}" /T >nul 2>&1
 
 :: ── Wait until the old exe file-lock is released ──────────────────
+set "RETRY=0"
 :waitloop
+set /a RETRY+=1
+if %RETRY% GTR 30 (
+    echo [X] Timed out waiting for DFIRVault to close. Update aborted.
+    timeout /t 5 /nobreak >nul
+    goto cleanup
+)
 timeout /t 1 /nobreak >nul
 2>nul (
     >>"%TARGET%" echo off
@@ -648,10 +655,15 @@ if errorlevel 1 (
 )
 
 :: ── Start updated DFIRVault ────────────────────────────────────────
-:: Use start /B to launch detached from this batch so the new exe
-:: does not inherit our restricted CREATE_NO_WINDOW handles.
+:: NOTE: do NOT use "start /B" here. This batch itself runs under a
+:: console-less parent (CREATE_NO_WINDOW), so /B — which tells the new
+:: process to share the caller's console instead of opening its own —
+:: leaves a console-subsystem build with no console at all: it launches
+:: and runs, but never becomes visible, which looks exactly like "it
+:: didn't reopen". Without /B, "start" allocates a fresh console (or
+:: none, for a --windowed build) for the new process as normal.
 echo [*] Starting updated DFIRVault...
-start "" /D "%EXE_DIR%" /B "%TARGET%"
+start "" /D "%EXE_DIR%" "%TARGET%"
 
 :cleanup
 :: ── Delete this batch file ─────────────────────────────────────────
@@ -674,21 +686,12 @@ exit /b 0
     )
 
 
-def check_for_updates():
-    """
-    Entry-point called from main() before the menu loop.
-    Silently returns if:
-      • not running as a frozen .exe
-      • no internet / GitHub unreachable
-      • already on latest version
-      • user previously chose to skip this version
-    """
-    if not getattr(sys, "frozen", False):
-        return  # .py script — no auto-update
+_upd_notified_tags = set()  # tags we've already surfaced a background notice for this session
 
-    own_exe = Path(sys.executable)
 
-    # ── 1. Fetch latest release from GitHub ───────────────────────
+def _upd_fetch_latest_release():
+    """Fetch latest release metadata from GitHub. Returns dict, or None on
+    any network/parse failure (rate-limited, offline, etc.)."""
     try:
         import urllib.request as _ureq
 
@@ -700,8 +703,61 @@ def check_for_updates():
             }
         )
         with _ureq.urlopen(req, timeout=8) as resp:
-            release = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
     except Exception:
+        return None
+
+
+def _upd_background_watcher(interval=300):
+    """Runs for the life of the app: re-checks GitHub for a newer release
+    every `interval` seconds (default 5 min) so a long-running session
+    doesn't miss an update published after startup. Never installs
+    anything itself — just prints a one-line notice the first time a new
+    version is seen; 'Check for Updates' (App Settings) does the install."""
+    if not getattr(sys, "frozen", False):
+        return
+    while True:
+        time.sleep(interval)
+        try:
+            release = _upd_fetch_latest_release()
+            if not release:
+                continue
+            remote_tag = release.get("tag_name", "").strip()
+            if not remote_tag or not _upd_newer(remote_tag, CURRENT_VERSION):
+                continue
+            skip_ver = RegistryConfig.load_config(_UPDATE_REG_SECTION, "SkipVersion", "")
+            if skip_ver and skip_ver.strip().lower() == remote_tag.lower():
+                continue
+            if remote_tag in _upd_notified_tags:
+                continue
+            _upd_notified_tags.add(remote_tag)
+            print()
+            warn(f"A new DFIRVault update ({remote_tag}) is available.")
+            info("Select 'Check for Updates' in App Settings to install it now.")
+        except Exception:
+            pass
+
+
+def check_for_updates(release=None):
+    """
+    Entry-point called from main() before the menu loop, and on-demand from
+    the App Settings menu. Silently returns if:
+      • not running as a frozen .exe
+      • no internet / GitHub unreachable
+      • already on latest version
+      • user previously chose to skip this version
+    `release` may be a pre-fetched payload (e.g. from the background
+    watcher) to avoid hitting the GitHub API twice.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    own_exe = Path(sys.executable)
+
+    # ── 1. Fetch latest release from GitHub ───────────────────────
+    if release is None:
+        release = _upd_fetch_latest_release()
+    if not release:
         return  # network unavailable or rate-limited — silently skip
 
     remote_tag = release.get("tag_name", "").strip()
@@ -7840,6 +7896,7 @@ def menu_app_settings():
         print(f"  {_c(C.CYAN,'[2]')} Toggle Minimize to Tray")
         print(f"  {_c(C.CYAN,'[3]')} Toggle Close to Tray  {_c(C.DIM, '(' + close_note + ')')}")
         print(f"  {_c(C.CYAN,'[4]')} Minimize to tray now")
+        print(f"  {_c(C.CYAN,'[5]')} Check for Updates now")
         print(f"  {_c(C.RED, '[0]')} Back")
         divider()
         ch = prompt("Choice:").strip()
@@ -7861,6 +7918,12 @@ def menu_app_settings():
         elif ch == "4":
             if _tray_start():
                 ok("Minimized to tray. Use the tray icon to reopen or exit.")
+        elif ch == "5":
+            if not getattr(sys, "frozen", False):
+                warn("Running from source — update checking only applies to compiled builds.")
+            else:
+                info("Checking GitHub for the latest release…")
+                check_for_updates()
         elif ch == "0":
             break
         else:
@@ -9183,6 +9246,7 @@ def main():
 
     start_tray_background_services()
     check_for_updates()
+    threading.Thread(target=_upd_background_watcher, daemon=True).start()
     clear_screen()
     print(BANNER)
     while True:
