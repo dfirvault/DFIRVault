@@ -18,8 +18,7 @@
 
 ---
 
-<img width="693" height="800" alt="image" src="https://github.com/user-attachments/assets/f8d38864-68d5-46cc-8749-020958a52dea" />
-
+<img width="756" height="1091" alt="image" src="https://github.com/user-attachments/assets/e9cdd543-02c6-49bc-8776-8562fe24e90b" />
 
 
 ## 🚀 Overview
