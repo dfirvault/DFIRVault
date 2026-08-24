@@ -52,7 +52,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.8"
+CURRENT_VERSION  = "v0.6.9"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -1001,7 +1001,12 @@ def _case_setup_splunk_monitor(case_name, case_path):
         err(f"Could not connect to Splunk: {exc}")
         return
 
-    index_name = prompt(f"Splunk index name [Enter = '{case_name}']:").strip() or case_name
+    index_name = case_name
+    print()
+    info(f"Splunk index will be named '{index_name}' (same as the case).")
+    custom = prompt("Press Enter to accept, or type a different index name:").strip()
+    if custom:
+        index_name = custom
 
     default_folder = os.path.join(case_path, "01 - Evidence", "logs")
     folder = None
@@ -1022,9 +1027,35 @@ def _case_setup_splunk_monitor(case_name, case_path):
         ok(f"Monitoring → {folder}  (index: {index_name})")
         mgr._open_web(index_name)
 
+def _case_find_locked_files(folder):
+    """Best-effort detection of files currently open/locked by another process.
+    Uses the rename-to-self trick: Windows refuses to rename a file that's
+    opened with an exclusive lock, so this works with no extra dependencies."""
+    locked = []
+    for dirpath, _, filenames in os.walk(folder):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                os.rename(fp, fp)
+            except OSError:
+                locked.append(fp)
+    return locked
+
+
 def _case_archive_single(target, target_path, dst, use_pw, pw):
     """Archive a single case folder to dst. Returns True on success."""
     zip_path = os.path.join(dst, f"{target}.zip")
+
+    locked = _case_find_locked_files(target_path)
+    if locked:
+        warn(f"'{target}' has {len(locked)} open file(s) — skipping to avoid a crash:")
+        for fp in locked[:5]:
+            print(f"    {_c(C.YELLOW, C.BULLET)} {fp}")
+        if len(locked) > 5:
+            print(f"    {_c(C.DIM, f'...and {len(locked)-5} more')}")
+        info("Close the file(s) above and try again.")
+        return False
+
     spinner(f"Archiving '{target}'…", 1.5)
     try:
         seven = _case_7zip()
@@ -1035,19 +1066,31 @@ def _case_archive_single(target, target_path, dst, use_pw, pw):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             shutil.make_archive(os.path.splitext(zip_path)[0], "zip", target_path)
-        if os.path.exists(zip_path):
-            spinner("Removing source folder…", 1.0)
-            shutil.rmtree(target_path)
-            ok(f"Archived → {zip_path}")
-            return True
-        else:
-            err(f"Archive creation failed for '{target}'.")
-            return False
     except FileNotFoundError:
         warn("7-Zip unavailable — using standard ZIP.")
-        shutil.make_archive(os.path.splitext(zip_path)[0], "zip", target_path)
-        ok(f"Archived (no password) → {zip_path}")
-        return True
+        try:
+            shutil.make_archive(os.path.splitext(zip_path)[0], "zip", target_path)
+        except (PermissionError, OSError) as e:
+            err(f"Archive creation failed for '{target}' — a file may have opened mid-run: {e}")
+            return False
+    except (PermissionError, OSError) as e:
+        err(f"Archive creation failed for '{target}': {e}")
+        return False
+
+    if not os.path.exists(zip_path):
+        err(f"Archive creation failed for '{target}'.")
+        return False
+
+    spinner("Removing source folder…", 1.0)
+    try:
+        shutil.rmtree(target_path)
+    except (PermissionError, OSError) as e:
+        warn(f"Archived OK, but could not remove the source folder for '{target}' — a file may still be open: {e}")
+        warn(f"Zip saved at: {zip_path}  — close the open file(s) and delete '{target_path}' manually.")
+        return False
+
+    ok(f"Archived → {zip_path}")
+    return True
 
 
 def case_archive(backup_location, case_folder):
@@ -1100,10 +1143,15 @@ def case_archive(backup_location, case_folder):
             use_pw = False
 
     info("Select destination folder for ZIPs…")
-    dst = pick_folder("Select backup destination")
-    if not dst:
-        warn("Cancelled.")
-        return
+    if backup_location and os.path.isdir(backup_location):
+        dst = backup_location
+        info(f"Using configured backup location: {dst}")
+    else:
+        warn("Configured backup location not found or not set.")
+        dst = pick_folder("Select backup destination")
+        if not dst:
+            warn("Cancelled.")
+            return
 
     print()
     subheader(f"Archive Queue  [{len(selected_targets)} case(s)]")
@@ -1656,6 +1704,31 @@ DEFAULT_SPLUNK_PATHS = [
     "/Applications/Splunk/bin/splunk",
 ]
 
+def _splunk_read_backup_location():
+    return RegistryConfig.load_config("Splunk", "backup_location", "")
+
+def _splunk_write_backup_location(path):
+    RegistryConfig.save_config("Splunk", "backup_location", path)
+
+def _splunk_resolve_backup_dir(prompt_label="Select backup destination"):
+    """Enforce the configured default backup location. Falls back to a
+    manual browse only when nothing is configured, and offers to save
+    that choice as the new default."""
+    bdir = _splunk_read_backup_location()
+    if bdir and os.path.isdir(bdir):
+        info(f"Using configured backup location: {bdir}")
+        return bdir
+    info(prompt_label + "…")
+    raw = prompt("Enter path (blank to browse):").strip()
+    bdir = raw or pick_folder(prompt_label)
+    if not bdir:
+        return None
+    if prompt(f"Save '{bdir}' as the default Splunk backup location? (y/n):").lower().startswith("y"):
+        _splunk_write_backup_location(bdir)
+        ok("Default backup location saved.")
+    return bdir
+
+
 class SplunkManager:
     def __init__(self):
         self.splunk_path = ""
@@ -2074,9 +2147,7 @@ class SplunkManager:
         bdir = None
         pw = None
         if ch in ("2", "3"):
-            info("Select backup destination for all indexes…")
-            raw_path = prompt("Enter path (blank to browse):").strip()
-            bdir = raw_path or pick_folder("Select backup directory")
+            bdir = _splunk_resolve_backup_dir("Select backup destination for all indexes")
             if not bdir:
                 warn("Cancelled."); return
             if prompt("Password-protect backups? (y/n):").lower().startswith("y"):
@@ -2153,9 +2224,7 @@ class SplunkManager:
             else: err("Invalid choice.")
 
     def _backup_flow(self, name):
-        info("Select backup destination…")
-        raw = prompt("Enter path (blank to browse):").strip()
-        bdir = raw or pick_folder("Select backup directory")
+        bdir = _splunk_resolve_backup_dir("Select backup destination")
         if not bdir: warn("Cancelled."); return False
         pw = None
         if prompt("Password-protect backup? (y/n):").lower().startswith("y"):
@@ -2176,11 +2245,14 @@ class SplunkManager:
     def main_menu(self):
         while True:
             header("SPLUNK INDEX MANAGER")
-            print(f"\n  {_c(C.CYAN,'[1]')} Create index + monitor folder")
+            bloc = _splunk_read_backup_location()
+            print(f"\n  {_c(C.DIM, 'Backup location:')} {_c(C.YELLOW, bloc or 'Not Set')}\n")
+            print(f"  {_c(C.CYAN,'[1]')} Create index + monitor folder")
             print(f"  {_c(C.CYAN,'[2]')} Monitor folder (existing index)")
             print(f"  {_c(C.CYAN,'[3]')} Manage indexes")
             print(f"  {_c(C.CYAN,'[4]')} Restore from backup")
             print(f"  {_c(C.CYAN,'[5]')} Open Splunk Web")
+            print(f"  {_c(C.CYAN,'[6]')} Change backup location")
             print(f"  {_c(C.RED, '[0]')} Back")
             divider()
             ch = prompt("Choice:").strip()
@@ -2189,6 +2261,13 @@ class SplunkManager:
             elif ch == "3": self._menu_manage_indexes()
             elif ch == "4": self._menu_restore()
             elif ch == "5": self._open_web()
+            elif ch == "6":
+                loc = pick_folder("Select Splunk Backup Location")
+                if loc and os.path.isdir(loc):
+                    _splunk_write_backup_location(loc)
+                    ok(f"Backup location set: {loc}")
+                else:
+                    warn("No valid location selected.")
             elif ch == "0": break
             else: err("Invalid choice.")
             pause()
