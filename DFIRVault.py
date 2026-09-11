@@ -52,7 +52,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.6.9"
+CURRENT_VERSION  = "v0.7.0"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -6797,21 +6797,34 @@ class BfForensicRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(response).encode())
 
-def bf_start_server(db_path, port=8000):
-    """Start the local web server with bodyfile addition support"""
+def bf_create_server(db_path, preferred_port=8000, max_port=8100):
+    """Bind (but don't yet run) the Bodyfile Explorer's HTTPServer.
+
+    This binds the socket synchronously in the caller's thread and returns
+    the ACTUAL port used. Callers should generate the HTML report and open
+    the browser using this returned port, not a port guessed beforehand -
+    that guess-then-bind pattern is what used to let the server land on a
+    different port than the one baked into the HTML/browser tab.
+    """
     handler = lambda *args: BfForensicRequestHandler(*args, db_path=db_path)
-    
-    try:
-        server = HTTPServer(('localhost', port), handler)
-    except OSError as e:
-        if "Address already in use" in str(e):
-            print(f"⚠️  Port {port} is in use, looking for next available port...")
-            port = bf_get_available_port(port + 1)
+    port = preferred_port
+    while True:
+        try:
             server = HTTPServer(('localhost', port), handler)
-            print(f"✅ Using port {port} instead")
-        else:
+            return server, port
+        except OSError as e:
+            if "Address already in use" in str(e) or getattr(e, "errno", None) in (48, 98, 10048):
+                port += 1
+                if port > max_port:
+                    raise Exception(f"No available ports found between {preferred_port} and {max_port}")
+                continue
             raise
-    
+
+def bf_run_server(server, db_path):
+    """Run an already-bound server (see bf_create_server) - starts the
+    'Add Bodyfile' watcher thread and serves forever on the port the
+    server was actually bound to."""
+    port = server.server_port
     print(f"🚀 Starting local server on http://localhost:{port}")
     print("💡 The HTML report will load data on-demand for fast performance")
     
@@ -6857,6 +6870,14 @@ def bf_start_server(db_path, port=8000):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n🛑 Server stopped")
+
+def bf_start_server(db_path, port=8000):
+    """Back-compat convenience wrapper: bind + run in one call.
+    Prefer bf_create_server() followed by bf_run_server() at new call
+    sites so the real port is known before the HTML report is generated
+    or the browser tab is opened."""
+    server, port = bf_create_server(db_path, port)
+    bf_run_server(server, db_path)
 
 # -------------------------------------------------------------------
 # Initial Setup Dialog
@@ -6911,16 +6932,15 @@ def bf_show_initial_dialog():
 # Main Conversion Function
 # -------------------------------------------------------------------
 
-def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=None):
+def bf_parse_bodyfile_rows(bodyfile_paths):
+    """Parse one or more Sleuthkit bodyfiles (v2/v3, pipe-delimited) into a
+    list of normalised row dicts. Shared by the CSV-only conversion path
+    and the CSV + interactive HTML report path so both stay in sync."""
     rows = []
-    processed = 0
-
     for bodyfile_path in bodyfile_paths:
-        bodyfile_name = os.path.basename(bodyfile_path)
         with open(bodyfile_path, "r", encoding="utf-8", errors="ignore") as infile:
             reader = csv.reader(infile, delimiter="|")
             for row in reader:
-                processed += 1
                 if len(row) not in (10, 11):
                     continue
 
@@ -6932,7 +6952,7 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
 
                 noteworthy, file_type = bf_assess_noteworthy(name, mode, atime, mtime, ctime, crtime)
 
-                row_dict = {
+                rows.append({
                     "MD5": md5,
                     "Name": name,
                     "Inode": inode,
@@ -6950,19 +6970,14 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
                     "_mtime_epoch": int(mtime) if mtime and mtime.isdigit() else 0,
                     "_ctime_epoch": int(ctime) if ctime and ctime.isdigit() else 0,
                     "_crtime_epoch": int(crtime) if crtime and crtime.isdigit() else 0,
-                }
+                })
+    return rows
 
-                rows.append(row_dict)
-
-    # Apply date range filtering if requested
-    if date_filter and date_filter["apply_filter"]:
-        rows = bf_filter_rows_by_date_range(rows, date_filter)
-
-    # Ensure output files have proper extensions
+def bf_write_rows_to_csv(rows, output_csv_path):
+    """Write parsed bodyfile rows out to a CSV at output_csv_path."""
     if not output_csv_path.endswith('.csv'):
         output_csv_path += '.csv'
-    
-    # Write CSV
+
     csv_headers = ["MD5","Name","Inode","Mode","UID","GID","Size",
                    "Atime (Accessed)","Mtime (Modified)","Ctime (Changed)","Crtime (Created)",
                    "Noteworthy","FileType"]
@@ -6974,6 +6989,29 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
                 r["MD5"], r["Name"], r["Inode"], r["Mode"], r["UID"], r["GID"], r["Size"],
                 r["Atime"], r["Mtime"], r["Ctime"], r["Crtime"], r["Noteworthy"], r["FileType"]
             ])
+    return output_csv_path
+
+def bf_convert_bodyfile_to_csv(bodyfile_path, output_csv_path, date_filter=None):
+    """Convert a SINGLE bodyfile to a plain CSV only - no database, no
+    HTML report, no web server started. Returns (output_csv_path, count)."""
+    rows = bf_parse_bodyfile_rows([bodyfile_path])
+
+    if date_filter and date_filter.get("apply_filter"):
+        rows = bf_filter_rows_by_date_range(rows, date_filter)
+
+    output_csv_path = bf_write_rows_to_csv(rows, output_csv_path)
+    return output_csv_path, len(rows)
+
+def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=None):
+    bodyfile_name = os.path.basename(bodyfile_paths[-1]) if bodyfile_paths else "default"
+    rows = bf_parse_bodyfile_rows(bodyfile_paths)
+
+    # Apply date range filtering if requested
+    if date_filter and date_filter["apply_filter"]:
+        rows = bf_filter_rows_by_date_range(rows, date_filter)
+
+    # Write CSV (also normalises the .csv extension)
+    output_csv_path = bf_write_rows_to_csv(rows, output_csv_path)
 
     print(f"\n✅ CSV written: {output_csv_path}")
     print(f"→ Processed records: {len(rows):,}")
@@ -6994,10 +7032,13 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
     # Test database queries
     bf_test_database_query(db_path)
 
-    # Get available port (starting from 8000)
-    port = bf_get_available_port(8000)
+    # Bind the server FIRST so we know the real port before generating the
+    # HTML report / opening the browser - this is what keeps the browser
+    # tab and the HTML's own API calls pointed at the port the server is
+    # actually listening on, even if the preferred port was taken.
+    server, port = bf_create_server(db_path, 8000)
     
-    # Generate lightweight HTML and start server
+    # Generate lightweight HTML using the confirmed port
     html_path = bf_generate_lightweight_html(db_path, output_csv_path, port)
     
     print(f"✅ Lightweight HTML report: {html_path}")
@@ -7005,11 +7046,13 @@ def bf_convert_and_generate_report(bodyfile_paths, output_csv_path, date_filter=
     print(f"🌐 Opening browser on port {port}...")
     
     # Start server in background thread
-    server_thread = threading.Thread(target=bf_start_server, args=(db_path, port), daemon=True)
+    server_thread = threading.Thread(target=bf_run_server, args=(server, db_path), daemon=True)
     server_thread.start()
     
-    # Wait a moment for server to start, then open browser
-    time.sleep(2)
+    # Brief pause purely to let the server thread get scheduled; the
+    # socket itself is already bound above, so the port is guaranteed
+    # correct regardless of this delay.
+    time.sleep(1)
     webbrowser.open(f'http://localhost:{port}/{os.path.basename(html_path)}')
     
     print("\n💡 The server is running in the background. Press Ctrl+C to stop when done.")
@@ -7034,15 +7077,27 @@ def menu_bodyfile_explorer():
     print()
 
     while True:
-        print(f"  {_c(C.CYAN, '[1]')} New Analysis  {_c(C.DIM, 'convert bodyfile(s) → CSV + HTML report')}")
+        print(f"  {_c(C.CYAN, '[1]')} New Analysis  {_c(C.DIM, 'convert bodyfile(s) → CSV, or CSV + interactive HTML report')}")
         print(f"  {_c(C.CYAN, '[2]')} Open Existing Database  {_c(C.DIM, 'reload a previous .db file')}")
         print(f"  {_c(C.RED,  '[0]')} Back")
+        print(f"  {_c(C.RED,  '[9]')} Exit")
         divider()
         ch = prompt("Choice:").strip()
 
         if ch == "1":
             clear_screen()
             header("NEW BODYFILE ANALYSIS")
+            print(f"  {_c(C.CYAN, '[1]')} CSV Only  {_c(C.DIM, 'convert bodyfile(s) → plain CSV, no web report')}")
+            print(f"  {_c(C.CYAN, '[2]')} Interactive HTML Report  {_c(C.DIM, 'bodyfile(s) → CSV + searchable web report')}")
+            print(f"  {_c(C.RED,  '[0]')} Back")
+            divider()
+            mode = prompt("Choice:").strip()
+
+            if mode == "1":
+                _bf_run_csv_only_queue()
+                continue
+            elif mode != "2":
+                continue
 
             info("Select input bodyfile(s)...")
             bodyfile_paths = pick_files(
@@ -7115,12 +7170,17 @@ def menu_bodyfile_explorer():
                 pause()
                 continue
 
-            port = bf_get_available_port(8000)
+            # Bind first so we know the REAL port before regenerating the
+            # HTML - the report was originally generated for whatever port
+            # happened to be free last time, which may not be free now.
+            server, port = bf_create_server(db_file, 8000)
+            csv_file = db_file.replace('.db', '.csv')
+            html_file = bf_generate_lightweight_html(db_file, csv_file, port)
             srv_thread = threading.Thread(
-                target=bf_start_server, args=(db_file, port), daemon=True
+                target=bf_run_server, args=(server, db_file), daemon=True
             )
             srv_thread.start()
-            time.sleep(2)
+            time.sleep(1)
             webbrowser.open(f'http://localhost:{port}/{os.path.basename(html_file)}')
             ok("Existing database loaded. Press Ctrl+C or close terminal tab to stop server.")
 
@@ -7130,6 +7190,109 @@ def menu_bodyfile_explorer():
             except KeyboardInterrupt:
                 pass
             break
+
+        elif ch == "0":
+            break
+        elif ch == "9":
+            print(); ok("Goodbye. Stay forensically sound."); print(); sys.exit(0)
+        else:
+            err("Invalid choice.")
+
+
+def _bf_run_csv_only_queue():
+    """New Analysis → CSV Only: queue up one or more bodyfile → CSV jobs
+    (each defaults to the bodyfile's own name with a .csv extension, saved
+    wherever the user picks via the save dialog), then run them all
+    sequentially on demand. No database, HTML report, or web server is
+    created for this path."""
+    queue = []  # list of {"bodyfile": path, "output_csv": path, "date_filter": {...}}
+
+    while True:
+        clear_screen()
+        header("BODYFILE → CSV (QUEUE)")
+
+        if queue:
+            print(f"  {_c(C.DIM, 'Queued jobs:')}")
+            for i, job in enumerate(queue, 1):
+                print(f"    {_c(C.CYAN, str(i)+'.')} {os.path.basename(job['bodyfile'])} "
+                      f"{_c(C.DIM, '→')} {job['output_csv']}")
+            print()
+        else:
+            info("Queue is empty - add a bodyfile to get started.")
+            print()
+
+        print(f"  {_c(C.CYAN, '[1]')} Add bodyfile to queue")
+        if queue:
+            plural = "s" if len(queue) != 1 else ""
+            print(f"  {_c(C.GREEN, '[2]')} Run queue  {_c(C.DIM, f'({len(queue)} job{plural})')}")
+            print(f"  {_c(C.YELLOW,'[3]')} Clear queue")
+        print(f"  {_c(C.RED,  '[0]')} Back")
+        divider()
+        ch = prompt("Choice:").strip()
+
+        if ch == "1":
+            while True:
+                bodyfile_path = pick_file(
+                    title="Select Bodyfile (v2/v3)",
+                    filetypes=[("Bodyfile", "*.txt *.body *.log"), ("All files", "*.*")]
+                )
+                if not bodyfile_path:
+                    warn("No input file selected.")
+                    pause()
+                    break
+
+                default_name = os.path.splitext(os.path.basename(bodyfile_path))[0] + ".csv"
+                output_csv = pick_save_file(
+                    title="Save CSV As",
+                    defaultextension=".csv",
+                    filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                    initialfile=default_name
+                )
+                if not output_csv:
+                    warn("No output location selected.")
+                    pause()
+                    break
+                if not output_csv.endswith('.csv'):
+                    output_csv += '.csv'
+
+                info("Configuring date range filter for this bodyfile...")
+                date_filter = bf_ask_date_range_filter()
+
+                queue.append({
+                    "bodyfile": bodyfile_path,
+                    "output_csv": output_csv,
+                    "date_filter": date_filter,
+                })
+                ok(f"Queued: {os.path.basename(bodyfile_path)} → {output_csv}")
+
+                if not prompt("Convert another bodyfile to CSV? (y/n):").strip().lower().startswith("y"):
+                    break
+
+        elif ch == "2" and queue:
+            clear_screen()
+            header("RUNNING CSV CONVERSIONS")
+            total = len(queue)
+            succeeded = 0
+            for idx, job in enumerate(queue, 1):
+                info(f"[{idx}/{total}] Converting {os.path.basename(job['bodyfile'])}...")
+                try:
+                    out_path, count = bf_convert_bodyfile_to_csv(
+                        job["bodyfile"], job["output_csv"], job["date_filter"]
+                    )
+                    ok(f"→ {out_path} ({count:,} records)")
+                    succeeded += 1
+                except Exception as exc:
+                    err(f"Conversion error for {os.path.basename(job['bodyfile'])}: {exc}")
+                    import traceback; traceback.print_exc()
+            print()
+            ok(f"Completed {succeeded}/{total} conversion job(s).")
+            pause()
+            queue.clear()
+
+        elif ch == "3" and queue:
+            queue.clear()
+            info("Queue cleared.")
+            pause()
 
         elif ch == "0":
             break
@@ -9337,3 +9500,4 @@ if __name__ == "__main__":
             main()
         except KeyboardInterrupt:
             print(); warn("Interrupted."); sys.exit(0)
+'
