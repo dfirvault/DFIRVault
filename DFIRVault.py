@@ -604,85 +604,73 @@ def _upd_download_with_progress(url: str, dest_path: str) -> bool:
 def _upd_write_and_launch_bat(own_exe: Path, new_exe: Path):
     """
     Write a self-replacing batch file to %TEMP% then launch it detached.
-    The batch:
-      1. taskkill /F /IM <exe_name> — kill all running instances
-      2. Loop until file lock is released (robust replace)
-      3. move /Y <new_exe> <own_exe>
-      4. Launch the updated executable
-      5. del "%~f0"
+    More robust for PyInstaller onefile builds.
     """
     bat_path = Path(os.environ.get("TEMP", str(own_exe.parent))) / "dfirvault_update.bat"
+
+    # Normalise everything to absolute Windows paths with backslashes
+    target   = str(own_exe.resolve())
+    newfile  = str(new_exe.resolve())
+    exe_dir  = str(own_exe.parent.resolve())
     exe_name = own_exe.name
-    
-    # Get the directory and filename for proper launching
-    exe_dir = str(own_exe.parent)
-    exe_filename = own_exe.name
+
+    # Escape for use inside a batch file (double any existing quotes just in case)
+    def bat_escape(p: str) -> str:
+        return p.replace('"', '""')
 
     bat = f'''@echo off
-setlocal enabledelayedexpansion
+setlocal EnableExtensions
+cd /d "{bat_escape(exe_dir)}"
 
-:: ── Configuration ──────────────────────────────────────────────────
-set "TARGET={exe_dir}\\{exe_filename}"
-set "NEWFILE={new_exe}"
-set "SELF=%~f0"
-set "EXE_DIR={exe_dir}"
-
-:: ── Kill all running DFIRVault instances ──────────────────────────
 echo [*] Killing existing DFIRVault processes...
-taskkill /F /IM "{exe_filename}" /T >nul 2>&1
+taskkill /F /IM "{bat_escape(exe_name)}" /T >nul 2>&1
 
-:: ── Wait until the old exe file-lock is released ──────────────────
+:: Wait for the old exe to fully release the file lock
 set "RETRY=0"
 :waitloop
 set /a RETRY+=1
-if %RETRY% GTR 30 (
+if %RETRY% GTR 40 (
     echo [X] Timed out waiting for DFIRVault to close. Update aborted.
-    timeout /t 5 /nobreak >nul
+    timeout /t 4 /nobreak >nul
     goto cleanup
 )
 timeout /t 1 /nobreak >nul
 2>nul (
-    >>"%TARGET%" echo off
+    >>"{bat_escape(target)}" echo.
 ) || goto waitloop
 
-:: ── Replace the exe ────────────────────────────────────────────────
 echo [*] Replacing executable...
-move /Y "%NEWFILE%" "%TARGET%" >nul
+move /Y "{bat_escape(newfile)}" "{bat_escape(target)}" >nul
 if errorlevel 1 (
     echo [X] Update failed: could not replace executable.
     timeout /t 5 /nobreak >nul
     goto cleanup
 )
 
-:: ── Start updated DFIRVault ────────────────────────────────────────
-:: NOTE: do NOT use "start /B" here. This batch itself runs under a
-:: console-less parent (CREATE_NO_WINDOW), so /B — which tells the new
-:: process to share the caller's console instead of opening its own —
-:: leaves a console-subsystem build with no console at all: it launches
-:: and runs, but never becomes visible, which looks exactly like "it
-:: didn't reopen". Without /B, "start" allocates a fresh console (or
-:: none, for a --windowed build) for the new process as normal.
+:: Give Windows a moment to finish the write
+timeout /t 2 /nobreak >nul
+
 echo [*] Starting updated DFIRVault...
-start "" /D "%EXE_DIR%" "%TARGET%"
+:: Critical for PyInstaller: launch by full path from the correct directory
+:: Do NOT use start /B
+start "" /D "{bat_escape(exe_dir)}" "{bat_escape(target)}"
 
 :cleanup
-:: ── Delete this batch file ─────────────────────────────────────────
-:: exit /b 0 must follow immediately — if del runs and cmd then tries
-:: to read the next instruction from the now-deleted file it produces
-:: the spurious "The batch file cannot be found" error.
-del /F /Q "%SELF%"
+del /F /Q "%~f0" >nul 2>&1
 exit /b 0
 '''
 
-    # Use utf-8 encoding to handle non-ASCII characters in paths
     bat_path.write_text(bat, encoding="utf-8")
 
-    # Launch the batch file in a way that ensures it runs independently
+    # Launch the batch completely detached
     subprocess.Popen(
         ["cmd.exe", "/c", str(bat_path)],
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
         close_fds=True,
-        cwd=str(own_exe.parent)
+        cwd=str(own_exe.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
