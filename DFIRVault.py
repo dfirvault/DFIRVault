@@ -1985,7 +1985,7 @@ class SplunkManager:
                             new.append(f"index = {index}" if in_s and s.startswith("index =") else line)
                         open(conf_path,"w",encoding="utf-8").write("\n".join(new))
                         ok(f"Updated monitor index → '{index}'"); return True
-            stanza = f"\n[monitor://{mon}]\ndisabled = false\nhost = dfir-server\nindex = {index}\n"
+            stanza = f"\n[monitor://{mon}]\ndisabled = false\nhost = dfir-server\nindex = {index}\ncrcSalt = <SOURCE>\n"
             open(conf_path,"a",encoding="utf-8").write(stanza)
             ok(f"Monitor added → {mon}  (index: {index})")
             info(f"Config: {conf_path}"); return True
