@@ -410,6 +410,15 @@ class _GuiTerminal:
         return q.get()
 
     def _begin_input(self, q, mask):
+        # Safety: if a previous input is somehow still pending (e.g. a
+        # caller died before Enter was pressed), release it so we don't
+        # deadlock the worker thread.
+        if self._input_pending is not None:
+            try:
+                self._input_pending.put("")
+            except Exception:
+                pass
+
         self._input_pending = q
         self._input_mask = mask
         self._masked_buffer = ""
@@ -422,25 +431,60 @@ class _GuiTerminal:
     def _on_key(self, event):
         if self._input_pending is None:
             return "break"
+
+        # Keep cursor pinned at end during input
         if self.text.compare("insert", "<", self._mark):
             self.text.mark_set("insert", "end")
-        if self._input_mask and event.char and event.char.isprintable():
-            self._masked_buffer += event.char
-            self.text.insert("end", "*")
+
+        if self._input_mask:
+            # Masked (password) mode — fully control the widget
+            if event.keysym == "Return":
+                return None  # let _on_return handle it
+            if event.keysym == "BackSpace":
+                if self._masked_buffer:
+                    self._masked_buffer = self._masked_buffer[:-1]
+                    # Remove the last displayed '*' (plus the tag-free char)
+                    self.text.delete("end-2c", "end-1c")
+                return "break"
+            if event.char and len(event.char) == 1 and event.char.isprintable():
+                self._masked_buffer += event.char
+                self.text.insert("end", "*")
+                self.text.see("end")
+                return "break"
+            # Block arrows, Home, End, Tab, Ctrl+V, etc. during password entry
             return "break"
-        if event.keysym == "BackSpace" and self._input_mask:
-            self._masked_buffer = self._masked_buffer[:-1]
+
+        # Non-masked input — allow normal editing, but let _on_return fire
+        if event.keysym == "Return":
+            return None
         return None
 
     def _on_return(self, event):
         if self._input_pending is None:
             return "break"
-        line = self._masked_buffer if self._input_mask else self.text.get(self._mark, "end-1c")
+
+        # Capture everything we need, then clear state atomically BEFORE
+        # any display updates so autorepeat/re-entry can't reprocess it.
+        pending = self._input_pending
+        was_masked = self._input_mask
+        self._input_pending = None
+        self._input_mask = False
+
+        if was_masked:
+            line = self._masked_buffer
+        else:
+            line = self.text.get(self._mark, "end-1c")
+
+        self._masked_buffer = ""
+
+        # Now update the display
         self.text.insert("end", "\n")
         self.text.mark_set(self._mark, "end-1c")
         self.text.config(state="disabled")
-        q, self._input_pending = self._input_pending, None
-        q.put(line)
+        self.text.see("end")
+
+        # Wake the blocked worker thread
+        pending.put(line)
         return "break"
 
     # ---- window / tray handling ----------------------------------
