@@ -2927,7 +2927,10 @@ def _elk_pattern_matches_index(pattern, index_name):
 
 
 def _elk_create_data_view(kibana_url, user, pw, req, title, time_field="timestamp_field", name=None):
-    """Create a Kibana data view (or legacy index-pattern). Returns True on success."""
+    """Create a Kibana data view (or legacy index-pattern).
+
+    Returns the data-view ID string on success, or None on failure.
+    """
     auth = (user, pw)
     headers = _elk_kibana_headers()
     payload = {
@@ -2945,7 +2948,16 @@ def _elk_create_data_view(kibana_url, user, pw, req, title, time_field="timestam
         )
         if r.status_code in (200, 201):
             ok(f"Data view created: {title}")
-            return True
+            try:
+                body = r.json()
+                # Response shapes: {"data_view": {"id": "...", ...}} or top-level id
+                dv = body.get("data_view") or body
+                view_id = dv.get("id") if isinstance(dv, dict) else None
+                if view_id:
+                    return str(view_id)
+            except Exception:
+                pass
+            return title  # fall back to title as id (legacy behaviour)
         # Fallback to legacy saved-objects API
         if r.status_code in (404, 400, 405):
             legacy = {
@@ -2960,11 +2972,15 @@ def _elk_create_data_view(kibana_url, user, pw, req, title, time_field="timestam
             )
             if r2.status_code in (200, 201):
                 ok(f"Index pattern created: {title}")
-                return True
+                try:
+                    body = r2.json()
+                    return str(body.get("id") or title)
+                except Exception:
+                    return title
             err(f"Failed to create data view/index-pattern: {r2.status_code} — {r2.text[:300]}")
-            return False
+            return None
         err(f"Failed to create data view: {r.status_code} — {r.text[:300]}")
-        return False
+        return None
     except Exception as e:
         msg = str(e)
         if "WRONG_VERSION_NUMBER" in msg or "SSLError" in msg:
@@ -2973,13 +2989,52 @@ def _elk_create_data_view(kibana_url, user, pw, req, title, time_field="timestam
             info("Try the URL again with http:// instead of https://")
         else:
             err(f"Data view creation error: {e}")
-        return False
+        return None
+
+
+def _elk_build_discover_url(kibana_url, data_view_id, time_field="timestamp_field"):
+    """Build a Kibana Discover deep-link that opens the given data view.
+
+    Uses the modern dataSource/dataViewId AppState format that Kibana 8+ expects.
+    Time range defaults to last 15 minutes; sort is newest-first on the time field.
+    """
+    base = kibana_url.rstrip("/")
+    # Rison-ish fragment — keep it compact and URL-safe
+    # Example shape from Kibana 8 Discover:
+    #   #/?_g=(filters:!(),refreshInterval:(pause:!t,value:60000),time:(from:now-15m,to:now))
+    #     &_a=(columns:!(),dataSource:(dataViewId:<id>,type:dataView),filters:!(),
+    #          interval:auto,query:(language:kuery,query:''),sort:!(!(<timeField>,desc)))
+    g = (
+        "(filters:!(),refreshInterval:(pause:!t,value:60000),"
+        "time:(from:now-15m,to:now))"
+    )
+    a = (
+        f"(columns:!(),dataSource:(dataViewId:{data_view_id},type:dataView),"
+        f"filters:!(),interval:auto,query:(language:kuery,query:''),"
+        f"sort:!(!({time_field},desc)))"
+    )
+    return f"{base}/app/discover#/?_g={g}&_a={a}"
+
+
+def _elk_open_discover(kibana_url, data_view_id, time_field="timestamp_field"):
+    """Open the system browser to Discover scoped to the given data view."""
+    if not data_view_id:
+        warn("No data-view ID available — cannot open Discover automatically.")
+        return
+    url = _elk_build_discover_url(kibana_url, data_view_id, time_field=time_field)
+    info(f"Opening Discover → {url}")
+    try:
+        webbrowser.open(url, new=2)
+        ok("Browser launched.")
+    except Exception as e:
+        err(f"Could not open browser: {e}")
+        print(f"\n  Open manually:\n  {_c(C.GREEN, url)}\n")
 
 
 def _elk_handle_data_view(es_url, user, pw, index_name, req):
     """After a successful upload: check existing data views for a pattern that
-    matches the new index. If found, remind the user. If not, guide them
-    through creating one (pre-populated with first 3 chars + *)."""
+    matches the new index. If found, remind the user (and open Discover).
+    If not, guide them through creating one and open Discover on the new view."""
     subheader("Kibana Data View Check")
 
     candidates = _elk_derive_kibana_candidates(es_url)
@@ -3006,13 +3061,26 @@ def _elk_handle_data_view(es_url, user, pw, index_name, req):
 
     if matching:
         ok(f"Found {len(matching)} data view(s) whose pattern matches '{index_name}':")
-        for v in matching:
-            print(f"    {_c(C.YELLOW, C.BULLET)} {v.get('title')}  "
-                  f"{_c(C.DIM, '(time field: ' + (v.get('timeFieldName') or 'n/a') + ')')}")
+        for i, v in enumerate(matching, 1):
+            print(f"    {_c(C.CYAN, f'[{i}]')} {v.get('title')}  "
+                  f"{_c(C.DIM, '(id: ' + str(v.get('id') or 'n/a') +
+                        ', time field: ' + (v.get('timeFieldName') or 'n/a') + ')')}")
         print()
-        warn("In Kibana → Analytics → Discover, select one of the data views above "
-             "from the dropdown so your newly uploaded data is visible.")
-        info("No new data view was created.")
+        # Pick which matching view to open
+        chosen = matching[0]
+        if len(matching) > 1:
+            raw = prompt(f"Open Discover for which data view? [1-{len(matching)}, Enter=1]:").strip()
+            if raw:
+                try:
+                    chosen = matching[int(raw) - 1]
+                except (ValueError, IndexError):
+                    warn("Invalid selection — using the first match.")
+                    chosen = matching[0]
+
+        view_id = chosen.get("id")
+        time_field = chosen.get("timeFieldName") or "timestamp_field"
+        info(f"Opening data view '{chosen.get('title')}' in Discover…")
+        _elk_open_discover(kibana_url, view_id, time_field=time_field)
         return
 
     info(f"No existing data view pattern matches index '{index_name}'.")
@@ -3042,8 +3110,12 @@ def _elk_handle_data_view(es_url, user, pw, index_name, req):
     if custom_tf:
         time_field = custom_tf
 
-    if _elk_create_data_view(kibana_url, user, pw, req, pattern, time_field=time_field, name=pattern):
-        info(f"Open Kibana Discover and select data view '{pattern}' from the dropdown.")
+    view_id = _elk_create_data_view(
+        kibana_url, user, pw, req, pattern, time_field=time_field, name=pattern
+    )
+    if view_id:
+        info(f"Opening new data view '{pattern}' in Discover…")
+        _elk_open_discover(kibana_url, view_id, time_field=time_field)
     else:
         warn("You can still create the data view manually in Kibana → Stack Management → Data Views.")
 
