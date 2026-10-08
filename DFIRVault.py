@@ -52,7 +52,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, Listbox, Scrollbar, ttk
 
 IS_WINDOWS = platform.system() == "Windows"
-CURRENT_VERSION  = "v0.7.2"
+CURRENT_VERSION  = "v0.7.4"
 _GH_RELEASES_API = "https://api.github.com/repos/dfirvault/DFIRVault/releases/latest"
 _UPDATE_REG_SECTION = "AutoUpdate"
 # Increase CSV field size limit to handle large fields
@@ -647,68 +647,93 @@ def _upd_download_with_progress(url: str, dest_path: str) -> bool:
 
 def _upd_write_and_launch_bat(own_exe: Path, new_exe: Path):
     """
-    Write a self-replacing batch file to %TEMP% then launch it detached.
-    More robust for PyInstaller onefile builds.
+    Write a self-replacing batch file next to the current exe (NOT in %TEMP%,
+    which can be purged while the parent is still exiting), then launch it
+    fully detached via `start "" /min cmd /c ...`.
     """
-    bat_path = Path(os.environ.get("TEMP", str(own_exe.parent))) / "dfirvault_update.bat"
+    # Write next to the exe — survives %TEMP% cleaners and Storage Sense
+    bat_path = own_exe.parent / "dfirvault_update.bat"
 
-    # Normalise everything to absolute Windows paths with backslashes
     target   = str(own_exe.resolve())
     newfile  = str(new_exe.resolve())
     exe_dir  = str(own_exe.parent.resolve())
     exe_name = own_exe.name
+    log_path = str((own_exe.parent / "dfirvault_update.log").resolve())
 
-    # Escape for use inside a batch file (double any existing quotes just in case)
     def bat_escape(p: str) -> str:
         return p.replace('"', '""')
 
+    # NOTE: no non-ASCII characters anywhere in this template.
     bat = f'''@echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "{bat_escape(exe_dir)}"
+echo [%DATE% %TIME%] updater starting > "{bat_escape(log_path)}"
 
-echo [*] Killing existing DFIRVault processes...
-taskkill /F /IM "{bat_escape(exe_name)}" /T >nul 2>&1
-
-:: Wait for the old exe to fully release the file lock
+echo [*] Waiting for parent DFIRVault process to exit...
 set "RETRY=0"
 :waitloop
 set /a RETRY+=1
+if %RETRY% GTR 60 (
+    echo [X] Timed out waiting for DFIRVault to exit. >> "{bat_escape(log_path)}"
+    goto cleanup
+)
+tasklist /FI "IMAGENAME eq {bat_escape(exe_name)}" 2>nul | find /I "{bat_escape(exe_name)}" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto waitloop
+)
+
+echo [*] Killing any remaining DFIRVault processes...
+taskkill /F /IM "{bat_escape(exe_name)}" /T >> "{bat_escape(log_path)}" 2>&1
+
+set "RETRY=0"
+:waitloop2
+set /a RETRY+=1
 if %RETRY% GTR 40 (
-    echo [X] Timed out waiting for DFIRVault to close. Update aborted.
-    timeout /t 4 /nobreak >nul
+    echo [X] Timed out waiting for file lock release. >> "{bat_escape(log_path)}"
     goto cleanup
 )
 timeout /t 1 /nobreak >nul
 2>nul (
     >>"{bat_escape(target)}" echo.
-) || goto waitloop
+) || goto waitloop2
 
 echo [*] Replacing executable...
-move /Y "{bat_escape(newfile)}" "{bat_escape(target)}" >nul
+move /Y "{bat_escape(newfile)}" "{bat_escape(target)}" >> "{bat_escape(log_path)}" 2>&1
 if errorlevel 1 (
-    echo [X] Update failed: could not replace executable.
+    echo [X] Update failed: could not replace executable. >> "{bat_escape(log_path)}"
     timeout /t 5 /nobreak >nul
     goto cleanup
 )
 
-:: Give Windows a moment to finish the write
 timeout /t 2 /nobreak >nul
 
 echo [*] Starting updated DFIRVault...
-:: Critical for PyInstaller: launch by full path from the correct directory
-:: Do NOT use start /B
 start "" /D "{bat_escape(exe_dir)}" "{bat_escape(target)}"
+echo [*] Updater done. >> "{bat_escape(log_path)}"
 
 :cleanup
 del /F /Q "%~f0" >nul 2>&1
 exit /b 0
 '''
 
-    bat_path.write_text(bat, encoding="utf-8")
+    # Write as mbcs (cp1252/cp437) — cmd.exe understands this natively and
+    # it will NEVER emit a UTF-8 BOM that would break line 1.
+    with open(bat_path, "w", encoding="mbcs", newline="\r\n") as fh:
+        fh.write(bat)
+        fh.flush()
+        os.fsync(fh.fileno())
 
-    # Launch the batch completely detached
+    # Tiny hand-off delay so Windows fully releases the file handle we just
+    # opened before we spawn the detached process. Without this, on some
+    # systems cmd.exe would open the file, hit EOF while we were still
+    # flushing, and exit immediately (the "cannot find the bat file" bug).
+    time.sleep(0.4)
+
+    # Launch via `start "" /min cmd /c ...` so the cmd window is fully
+    # independent of our process tree, then detach.
     subprocess.Popen(
-        ["cmd.exe", "/c", str(bat_path)],
+        ["cmd.exe", "/c", "start", "", "/min", "cmd.exe", "/c", str(bat_path)],
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
         close_fds=True,
         cwd=str(own_exe.parent),
@@ -2373,6 +2398,345 @@ def menu_splunk():
 # ══════════════════════════════════════════════════════════════════
 
 # Lazy-import pandas and requests only when this section runs
+
+# ──────────────────────────────────────────────────────────────────
+#  NEW — IP column detection, geo mapping/pipeline, data view helpers
+# ──────────────────────────────────────────────────────────────────
+
+_ELK_IPV4_RE = re.compile(
+    r'^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$'
+)
+_ELK_IPV6_RE = re.compile(
+    r'^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|'
+    r'^(?:[0-9a-fA-F]{1,4}:){1,7}:$|'
+    r'^:(?::[0-9a-fA-F]{1,4}){1,7}$|'
+    r'^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$'
+)
+
+
+def _elk_is_ip(value):
+    """True if value is a plain IPv4 or IPv6 literal (no port, no CIDR)."""
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s or " " in s or "/" in s:
+        return False
+    return bool(_ELK_IPV4_RE.match(s) or _ELK_IPV6_RE.match(s))
+
+
+def _elk_detect_ip_columns(df, sample_rows=10):
+    """
+    Inspect the first `sample_rows` rows of a dataframe and return the list
+    of column names where EVERY non-empty sampled value parses as an IP.
+    Columns that are entirely empty in the sample are ignored.
+    """
+    ip_cols = []
+    n = min(sample_rows, len(df))
+    if n == 0:
+        return ip_cols
+
+    for col in df.columns:
+        vals = df[col].head(n).tolist()
+        non_empty = [v for v in vals if v is not None and str(v).strip() != ""]
+        if not non_empty:
+            continue
+        if all(_elk_is_ip(v) for v in non_empty):
+            ip_cols.append(col)
+    return ip_cols
+
+
+# Canonical geo_point mapping used for every detected IP column
+def _elk_geo_properties(ip_col):
+    """Return the mapping fragment for a single IP column with geo metadata."""
+    return {
+        ip_col: {"type": "ip"},
+        f"{ip_col}_geo": {"type": "geo_point"},
+        f"{ip_col}_country": {"type": "keyword"},
+        f"{ip_col}_country_iso": {"type": "keyword"},
+        f"{ip_col}_region": {"type": "keyword"},
+        f"{ip_col}_city": {"type": "keyword"},
+        f"{ip_col}_location": {"type": "keyword"},
+        f"{ip_col}_asn": {"type": "keyword"},
+        f"{ip_col}_as_org": {"type": "keyword"},
+    }
+
+
+def _elk_build_geo_pipeline(pipeline_name, ip_cols):
+    """
+    Build an Elasticsearch ingest pipeline that:
+      1. copies each IP column to a `_lookup` scratch field
+      2. runs the `geoip` processor against it (with the standard
+         GeoLite2-City database ES ships as `geoip_databases`)
+      3. writes lat/lon into <col>_geo, and country/region/city/asn into
+         the companion keyword fields
+    Idempotent: `_meta` records what it was generated for.
+    """
+    processors = []
+    for col in ip_cols:
+        scratch = f"__geoip_{col}"
+
+        # Stage the value into a scratch field (geoip can't read a nested path directly)
+        processors.append({
+            "set": {
+                "field": scratch,
+                "value": "{{{" + col + "}}}",
+                "ignore_failure": True,
+            }
+        })
+        # Skip empty values (geoip processor errors on empty strings)
+        processors.append({
+            "remove": {
+                "field": scratch,
+                "if": f"ctx.{scratch} == null || ctx.{scratch} == ''",
+                "ignore_failure": True,
+            }
+        })
+        # GeoIP lookup — only runs if the scratch field survived the remove above
+        processors.append({
+            "geoip": {
+                "field": scratch,
+                "target_field": f"{col}_geo_raw",
+                "properties": ["country_iso_code", "country_name", "region_name",
+                               "city_name", "location", "asn", "as_org"],
+                "ignore_missing": True,
+                "ignore_failure": True,
+                "if": f"ctx.{scratch} != null",
+            }
+        })
+        # Flatten the geoip response into stable per-column fields
+        for src, dst_suffix in [
+            ("country_iso_code", "country_iso"),
+            ("country_name",     "country"),
+            ("region_name",      "region"),
+            ("city_name",        "city"),
+            ("asn",              "asn"),
+            ("as_org",           "as_org"),
+        ]:
+            processors.append({
+                "set": {
+                    "field": f"{col}_{dst_suffix}",
+                    "value": "{{{ " + f"{col}_geo_raw.{src}" + " }}}",
+                    "ignore_failure": True,
+                    "if": f"ctx.{col}_geo_raw != null",
+                }
+            })
+        # location is an object {lat, lon} — copy as geo_point
+        processors.append({
+            "set": {
+                "field": f"{col}_geo",
+                "value": "{{{ " + f"{col}_geo_raw.location" + " }}}",
+                "ignore_failure": True,
+                "if": f"ctx.{col}_geo_raw != null && ctx.{col}_geo_raw.location != null",
+            }
+        })
+        # Drop scratch fields so they don't pollute the document
+        processors.append({"remove": {"field": f"{col}_geo_raw", "ignore_missing": True}})
+        processors.append({"remove": {"field": scratch, "ignore_missing": True}})
+
+    return {
+        "description": f"DFIRVault geoip enrichment for {', '.join(ip_cols)}",
+        "processors": processors,
+        "_meta": {"dfirvault_generated_for": ip_cols},
+    }
+
+
+def _elk_ensure_geo_pipeline(url, user, pw, req, pipeline_name, ip_cols):
+    """PUT the geoip ingest pipeline. Returns True on success."""
+    body = _elk_build_geo_pipeline(pipeline_name, ip_cols)
+    r = req.put(f"{url}/_ingest/pipeline/{pipeline_name}",
+                auth=(user, pw),
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(body),
+                verify=False)
+    if r.status_code in (200, 201):
+        ok(f"Geo ingest pipeline '{pipeline_name}' created "
+           f"for {len(ip_cols)} IP column(s): {', '.join(ip_cols)}")
+        return True
+    err(f"Could not create ingest pipeline: {r.status_code} — {r.text}")
+    return False
+
+
+def _elk_ensure_geo_mapping(url, user, pw, req, index_name, ip_cols):
+    """PUT _mapping with geo_point / keyword subfields for each IP column."""
+    props = {}
+    for col in ip_cols:
+        props.update(_elk_geo_properties(col))
+    body = {"properties": props}
+    r = req.put(f"{url}/{index_name}/_mapping",
+                auth=(user, pw),
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(body),
+                verify=False)
+    if r.status_code == 200:
+        ok(f"Geo mapping applied to '{index_name}' ({len(ip_cols)} IP field(s)).")
+        return True
+    err(f"Could not apply geo mapping: {r.status_code} — {r.text}")
+    return False
+
+
+# ── Data view helpers ─────────────────────────────────────────────
+
+def _elk_get_data_views(url, user, pw, req):
+    """
+    Return a list of {'id':..., 'title':..., 'pattern':...} for every
+    Kibana data view. Uses the *Elasticsearch* saved-objects API so we
+    don't need to talk to the Kibana port at all (works on 7.x and 8.x).
+    """
+    try:
+        r = req.get(
+            f"{url}/_search",
+            auth=(user, pw),
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({
+                "size": 500,
+                "query": {"term": {"type": "index-pattern"}},
+                "_source": ["index-pattern.title", "index-pattern.timeFieldName"],
+            }),
+            params={"index": ".kibana*"},
+            verify=False,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        hits = r.json().get("hits", {}).get("hits", [])
+        out = []
+        for h in hits:
+            src = h.get("_source", {}).get("index-pattern", {})
+            out.append({
+                "id":      h.get("_id"),
+                "title":   src.get("title", ""),
+                "time":    src.get("timeFieldName", ""),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _elk_pattern_matches_index(pattern, index_name):
+    """
+    Return True if `pattern` (an ES/Kibana wildcard pattern like
+    'firewall-*' or 'logs-2026.10.*') matches index_name.
+    Uses a simple fnmatch translation; both use the same wildcard grammar.
+    """
+    if not pattern:
+        return False
+    if pattern == index_name:
+        return True
+    # Kibana patterns also treat commas as OR
+    for p in [p.strip() for p in pattern.split(",") if p.strip()]:
+        if p == index_name:
+            return True
+        # Convert glob to regex: * -> .*, ? -> .
+        rx = "^" + re.escape(p).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+        if re.match(rx, index_name):
+            return True
+    return False
+
+
+def _elk_create_data_view(url, user, pw, req, title, pattern, time_field="timestamp_field"):
+    """
+    Create a Kibana data view (a.k.a. index pattern) via the *saved objects*
+    API. Works against 7.x and 8.x without needing the Kibana HTTP port.
+    """
+    doc = {
+        "type": "index-pattern",
+        "attributes": {
+            "title":         pattern,
+            "timeFieldName": time_field,
+        },
+    }
+    r = req.post(f"{url}/_kibana_saved_objects/index-pattern/{title}",
+                 auth=(user, pw),
+                 headers={"Content-Type": "application/json"},
+                 data=json.dumps(doc),
+                 params={"overwrite": "true"},
+                 verify=False)
+    if r.status_code in (200, 201):
+        ok(f"Data view '{title}' created  (pattern: {pattern}, time: {time_field})")
+        return True
+    err(f"Could not create data view: {r.status_code} — {r.text}")
+    return False
+
+
+def _elk_recommend_data_view(url, user, pw, req, index_name):
+    """
+    After a successful upload:
+      1. Look at every existing data view pattern.
+      2. If any already matches `index_name`, tell the user which one to
+         pick in Kibana Discover.
+      3. Otherwise, walk them through creating one, pre-populated with
+         the first 3 characters of the index followed by '*'.
+    """
+    subheader("Data View Check")
+
+    views = _elk_get_data_views(url, user, pw, req)
+    matched = [v for v in views
+               if _elk_pattern_matches_index(v.get("pattern", ""), index_name)]
+
+    if matched:
+        print()
+        ok(f"Index '{index_name}' is already covered by "
+           f"{len(matched)} existing data view(s):")
+        for v in matched:
+            print(f"    {_c(C.YELLOW, C.BULLET)} "
+                  f"{_c(C.BOLD, v['pattern'])}  "
+                  f"{_c(C.DIM, '(id: ' + str(v['id']) + ')')}")
+        print()
+        info(f"Open Kibana → Discover → Data View dropdown and select one of the above.")
+        return
+
+    # No match — offer to create one
+    print()
+    warn(f"No existing data view pattern matches '{index_name}'.")
+    default_pattern = index_name[:3] + "*" if len(index_name) >= 3 else index_name + "*"
+
+    print()
+    print(f"  {_c(C.CYAN,'[1]')} Use the suggested pattern  "
+          f"{_c(C.YELLOW, default_pattern)}")
+    print(f"  {_c(C.CYAN,'[2]')} Enter your own pattern")
+    print(f"  {_c(C.CYAN,'[3]')} Skip creating a data view")
+    divider()
+    ch = prompt("Choice [1/2/3]:").strip()
+
+    if ch == "3":
+        info("Skipped — you can create the data view later from Kibana.")
+        return
+
+    if ch == "1":
+        pattern = default_pattern
+    elif ch == "2":
+        pattern = prompt("Enter your data view pattern "
+                         "(e.g. 'firewall-*' or 'logs-2026.*'):").strip()
+        if not pattern:
+            warn("Empty pattern — skipping data view creation.")
+            return
+    else:
+        err("Invalid choice.")
+        return
+
+    title = prompt(f"Data view name [Enter = '{pattern}']:").strip() or pattern
+    time_field = prompt(f"Time field [Enter = 'timestamp_field']:").strip() or "timestamp_field"
+
+    if _elk_create_data_view(url, user, pw, req, title, pattern, time_field):
+        print()
+        info("Open Kibana → Discover and pick the new data view from the "
+             "Data View dropdown (top-left of the search bar).")
+
+
+def _elk_attach_geo_pipeline(url, user, pw, req, index_name, pipeline_name):
+    """Set index.default_pipeline so every bulk insert auto-enriches geo fields."""
+    body = {"index": {"default_pipeline": pipeline_name}}
+    r = req.put(f"{url}/{index_name}/_settings",
+                auth=(user, pw),
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(body),
+                verify=False)
+    if r.status_code == 200:
+        ok(f"Index '{index_name}' will now run pipeline '{pipeline_name}' on ingest.")
+        return True
+    err(f"Could not set default_pipeline: {r.status_code} — {r.text}")
+    return False
+
 def _elk_load_heavy():
     try:
         import requests as _req
@@ -2478,22 +2842,52 @@ def _elk_guess_ts(columns):
     return None
 
 def _elk_select_ts(df):
+    """
+    Let the user pick the timestamp column AND auto-detect IP columns.
+
+    Returns (ts_col, ip_cols):
+      ts_col  — name of the timestamp column (or None)
+      ip_cols — list of column names that look like pure-IP columns in the
+                first 10 rows
+    """
     print("\n  CSV columns with sample values:")
-    if df.empty: warn("DataFrame is empty."); return None
+    if df.empty:
+        warn("DataFrame is empty.")
+        return None, []
+
     sample = df.iloc[0].to_dict()
     for i, col in enumerate(df.columns, 1):
         print(f"  {_c(C.CYAN,str(i))}. {col}  {_c(C.DIM, str(sample.get(col,''))[:60])}")
+
     guess = _elk_guess_ts(df.columns)
     if guess:
         info(f"Suggested timestamp column: {guess}")
+
+    ts_col = None
     while True:
         sel = prompt(f"Select timestamp column [Enter = '{guess}']:").strip()
         if sel == "" and guess:
-            return guess
+            ts_col = guess
+            break
         try:
-            return df.columns[int(sel) - 1]
+            ts_col = df.columns[int(sel) - 1]
+            break
         except (ValueError, IndexError):
             err("Invalid selection.")
+
+    # ── IP column detection ────────────────────────────────────
+    print()
+    info("Inspecting first 10 rows for pure-IP columns…")
+    ip_cols = _elk_detect_ip_columns(df, sample_rows=10)
+
+    if ip_cols:
+        ok(f"Detected {len(ip_cols)} IP-address column(s):")
+        for c in ip_cols:
+            print(f"    {_c(C.YELLOW, C.BULLET)} {c}")
+    else:
+        info("No pure-IP columns detected in the first 10 rows.")
+
+    return ts_col, ip_cols
 
 def _elk_convert_csv(csv_path, index_name, ts_col, pd):
     try:
@@ -2986,22 +3380,56 @@ def menu_csv2elk():
             idx   = _elk_create_index(url, user, pw, base, req)
             fpath = pick_file("Select CSV file", [("CSV","*.csv")])
             if not fpath: warn("No file selected."); continue
+
             df     = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
             df     = df.where(pd.notnull(df), None)
-            ts_col = _elk_select_ts(df)
+
+            ts_col, ip_cols = _elk_select_ts(df)
+
+            # ── NEW: wire up geo enrichment if any IP columns exist ──
+            if ip_cols:
+                pipeline_name = f"{idx}_geoip"
+                if (_elk_ensure_geo_pipeline(url, user, pw, req, pipeline_name, ip_cols)
+                        and _elk_ensure_geo_mapping(url, user, pw, req, idx, ip_cols)
+                        and _elk_attach_geo_pipeline(url, user, pw, req, idx, pipeline_name)):
+                    info("Geo enrichment is active for this index.")
+                else:
+                    warn("Geo enrichment setup failed — upload will still proceed.")
+            else:
+                info("Skipping geo enrichment (no IP columns detected).")
+
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
-            if jpath: _elk_upload(url, user, pw, idx, jpath, req)
+            if jpath:
+                _elk_upload(url, user, pw, idx, jpath, req)
+                _elk_recommend_data_view(url, user, pw, req, idx)
 
         elif ch == "2":
             idx = _elk_pick_index(url, user, pw, req)
             if not idx: continue
             fpath = pick_file("Select CSV file", [("CSV","*.csv")])
             if not fpath: warn("No file selected."); continue
+
             df     = pd.read_csv(fpath, encoding="utf-8", low_memory=False, on_bad_lines="warn")
             df     = df.where(pd.notnull(df), None)
-            ts_col = _elk_select_ts(df)
+
+            ts_col, ip_cols = _elk_select_ts(df)
+
+            # ── NEW: for an existing index, only add fields we haven't seen.
+            #          Skipping the pipeline rebuild is safe: if it already
+            #          exists, PUT is idempotent.
+            if ip_cols:
+                pipeline_name = f"{idx}_geoip"
+                if (_elk_ensure_geo_pipeline(url, user, pw, req, pipeline_name, ip_cols)
+                        and _elk_ensure_geo_mapping(url, user, pw, req, idx, ip_cols)
+                        and _elk_attach_geo_pipeline(url, user, pw, req, idx, pipeline_name)):
+                    info("Geo enrichment is active for this index.")
+                else:
+                    warn("Geo enrichment setup failed — upload will still proceed.")
+
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
-            if jpath: _elk_upload(url, user, pw, idx, jpath, req)
+            if jpath:
+                _elk_upload(url, user, pw, idx, jpath, req)
+                _elk_recommend_data_view(url, user, pw, req, idx)
 
         elif ch == "3":
             idx = _elk_pick_index(url, user, pw, req)
