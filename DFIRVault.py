@@ -2576,39 +2576,47 @@ def _elk_ensure_geo_mapping(url, user, pw, req, index_name, ip_cols):
 
 # ── Data view helpers ─────────────────────────────────────────────
 
-def _elk_get_data_views(url, user, pw, req):
-    """
-    Return a list of {'id':..., 'title':..., 'pattern':...} for every
-    Kibana data view. Uses the *Elasticsearch* saved-objects API so we
-    don't need to talk to the Kibana port at all (works on 7.x and 8.x).
-    """
+
+
+def _elk_get_kibana_url(es_url):
+    """Derive the Kibana base URL from the Elasticsearch URL.
+    User can override via HKCU\\Software\\DFIRVault\\Elasticsearch\\kibana_url."""
+    override = RegistryConfig.load_config("Elasticsearch", "kibana_url", "")
+    if override:
+        return override.rstrip("/")
+
+    # Best-effort: same host, default Kibana port 5601
+    from urllib.parse import urlparse, urlunparse
+    p = urlparse(es_url)
+    host = p.hostname or "localhost"
+    scheme = p.scheme or "http"
+    return f"{scheme}://{host}:5601"
+
+
+def _elk_get_data_views(kibana_url, user, pw, req):
+    """List Kibana data views via the proper Kibana API."""
     try:
         r = req.get(
-            f"{url}/_search",
+            f"{kibana_url}/api/data_views",
             auth=(user, pw),
-            headers={"Content-Type": "application/json"},
-            data=json.dumps({
-                "size": 500,
-                "query": {"term": {"type": "index-pattern"}},
-                "_source": ["index-pattern.title", "index-pattern.timeFieldName"],
-            }),
-            params={"index": ".kibana*"},
+            headers={"kbn-xsrf": "true", "Accept": "application/json"},
             verify=False,
             timeout=10,
         )
         if r.status_code != 200:
+            warn(f"Kibana data_views API returned {r.status_code}: {r.text[:200]}")
             return []
-        hits = r.json().get("hits", {}).get("hits", [])
         out = []
-        for h in hits:
-            src = h.get("_source", {}).get("index-pattern", {})
+        for dv in r.json().get("data_view", []):
             out.append({
-                "id":      h.get("_id"),
-                "title":   src.get("title", ""),
-                "time":    src.get("timeFieldName", ""),
+                "id":      dv.get("id"),
+                "title":   dv.get("title", ""),   # older field
+                "pattern": dv.get("title", ""),   # canonical field in 8.x
+                "time":    dv.get("timeFieldName", ""),
             })
         return out
-    except Exception:
+    except Exception as exc:
+        warn(f"Could not reach Kibana at {kibana_url}: {exc}")
         return []
 
 
@@ -2633,56 +2641,55 @@ def _elk_pattern_matches_index(pattern, index_name):
     return False
 
 
-def _elk_create_data_view(url, user, pw, req, title, pattern, time_field="timestamp_field"):
-    """
-    Create a Kibana data view (a.k.a. index pattern) via the *saved objects*
-    API. Works against 7.x and 8.x without needing the Kibana HTTP port.
-    """
-    doc = {
-        "type": "index-pattern",
-        "attributes": {
+def _elk_create_data_view(kibana_url, user, pw, req, title, pattern, time_field="timestamp_field"):
+    """Create a Kibana data view via the proper Kibana API."""
+    body = {
+        "data_view": {
             "title":         pattern,
+            "name":          title,
             "timeFieldName": time_field,
         },
+        "override": True,
     }
-    r = req.post(f"{url}/_kibana_saved_objects/index-pattern/{title}",
-                 auth=(user, pw),
-                 headers={"Content-Type": "application/json"},
-                 data=json.dumps(doc),
-                 params={"overwrite": "true"},
-                 verify=False)
+    try:
+        r = req.post(
+            f"{kibana_url}/api/data_views/data_view",
+            auth=(user, pw),
+            headers={"kbn-xsrf": "true", "Content-Type": "application/json"},
+            data=json.dumps(body),
+            verify=False,
+        )
+    except Exception as exc:
+        err(f"Could not reach Kibana: {exc}")
+        return False
+
     if r.status_code in (200, 201):
         ok(f"Data view '{title}' created  (pattern: {pattern}, time: {time_field})")
         return True
-    err(f"Could not create data view: {r.status_code} — {r.text}")
+    err(f"Could not create data view: {r.status_code} — {r.text[:300]}")
     return False
 
 
-def _elk_recommend_data_view(url, user, pw, req, index_name):
-    """
-    After a successful upload:
-      1. Look at every existing data view pattern.
-      2. If any already matches `index_name`, tell the user which one to
-         pick in Kibana Discover.
-      3. Otherwise, walk them through creating one, pre-populated with
-         the first 3 characters of the index followed by '*'.
-    """
+def _elk_recommend_data_view(es_url, kibana_url, user, pw, req, index_name):
     subheader("Data View Check")
 
-    views = _elk_get_data_views(url, user, pw, req)
+    # Try Kibana first; if unreachable, skip silently
+    views = _elk_get_data_views(kibana_url, user, pw, req)
+    if not views:
+        warn(f"Could not enumerate data views from {kibana_url}.")
+        info("You can create one manually in Kibana → Stack Management → Data Views.")
+        return
+
     matched = [v for v in views
                if _elk_pattern_matches_index(v.get("pattern", ""), index_name)]
 
     if matched:
         print()
-        ok(f"Index '{index_name}' is already covered by "
-           f"{len(matched)} existing data view(s):")
+        ok(f"Index '{index_name}' is already covered by {len(matched)} data view(s):")
         for v in matched:
-            print(f"    {_c(C.YELLOW, C.BULLET)} "
-                  f"{_c(C.BOLD, v['pattern'])}  "
-                  f"{_c(C.DIM, '(id: ' + str(v['id']) + ')')}")
+            print(f"    {_c(C.YELLOW, C.BULLET)} {_c(C.BOLD, v['pattern'])}")
         print()
-        info(f"Open Kibana → Discover → Data View dropdown and select one of the above.")
+        info("Open Kibana → Discover → Data View dropdown and select one of the above.")
         return
 
     # No match — offer to create one
@@ -2691,8 +2698,7 @@ def _elk_recommend_data_view(url, user, pw, req, index_name):
     default_pattern = index_name[:3] + "*" if len(index_name) >= 3 else index_name + "*"
 
     print()
-    print(f"  {_c(C.CYAN,'[1]')} Use the suggested pattern  "
-          f"{_c(C.YELLOW, default_pattern)}")
+    print(f"  {_c(C.CYAN,'[1]')} Use the suggested pattern  {_c(C.YELLOW, default_pattern)}")
     print(f"  {_c(C.CYAN,'[2]')} Enter your own pattern")
     print(f"  {_c(C.CYAN,'[3]')} Skip creating a data view")
     divider()
@@ -2705,8 +2711,7 @@ def _elk_recommend_data_view(url, user, pw, req, index_name):
     if ch == "1":
         pattern = default_pattern
     elif ch == "2":
-        pattern = prompt("Enter your data view pattern "
-                         "(e.g. 'firewall-*' or 'logs-2026.*'):").strip()
+        pattern = prompt("Enter your data view pattern (e.g. 'firewall-*'):").strip()
         if not pattern:
             warn("Empty pattern — skipping data view creation.")
             return
@@ -2717,10 +2722,9 @@ def _elk_recommend_data_view(url, user, pw, req, index_name):
     title = prompt(f"Data view name [Enter = '{pattern}']:").strip() or pattern
     time_field = prompt(f"Time field [Enter = 'timestamp_field']:").strip() or "timestamp_field"
 
-    if _elk_create_data_view(url, user, pw, req, title, pattern, time_field):
+    if _elk_create_data_view(kibana_url, user, pw, req, title, pattern, time_field):
         print()
-        info("Open Kibana → Discover and pick the new data view from the "
-             "Data View dropdown (top-left of the search bar).")
+        info("Open Kibana → Discover and pick the new data view from the dropdown.")
 
 
 def _elk_attach_geo_pipeline(url, user, pw, req, index_name, pipeline_name):
@@ -3346,6 +3350,8 @@ def _elk_import_index(url, user, pw, req):
 #  UPDATED MAIN MENU  (option 4 = Export, option 5 = Import)
 # ──────────────────────────────────────────────────────────────────
 def menu_csv2elk():
+    kibana_url = _elk_get_kibana_url(url)
+    info(f"Kibana endpoint: {kibana_url}")
     req, pd = _elk_load_heavy()
     if not req or not pd:
         pause(); return
@@ -3401,7 +3407,7 @@ def menu_csv2elk():
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
             if jpath:
                 _elk_upload(url, user, pw, idx, jpath, req)
-                _elk_recommend_data_view(url, user, pw, req, idx)
+                _elk_recommend_data_view(url, kibana_url, user, pw, req, idx)
 
         elif ch == "2":
             idx = _elk_pick_index(url, user, pw, req)
@@ -3429,7 +3435,7 @@ def menu_csv2elk():
             jpath  = _elk_convert_csv(fpath, idx, ts_col, pd)
             if jpath:
                 _elk_upload(url, user, pw, idx, jpath, req)
-                _elk_recommend_data_view(url, user, pw, req, idx)
+                _elk_recommend_data_view(url, kibana_url, user, pw, req, idx)
 
         elif ch == "3":
             idx = _elk_pick_index(url, user, pw, req)
